@@ -325,14 +325,19 @@ def mejor_estimacion_con_fallback(
 
 
 def calculate_elasticity(
-    ventas_limpias: pd.DataFrame,
+    ventas_nse: pd.DataFrame,
     promociones: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
-    """Calcula elasticidad trimestral robusta por SKU."""
-    ventas = ventas_limpias.copy()
+    """Calcula elasticidad trimestral robusta por SKU usando la base limpia + NSE.
+
+    La entrada debe ser la base maestra generada en la vista 1:
+    ventas_nse = ventas limpias + cruce con NSE. Así la elasticidad conserva
+    categoria_est_socio y estado para las vistas posteriores.
+    """
+    ventas = ventas_nse.copy()
     ventas.columns = ventas.columns.astype(str).str.strip()
 
-    ventas["tran_date"] = pd.to_datetime(ventas["tran_date"], errors="coerce")
+    ventas["tran_date"] = parse_transaction_dates(ventas["tran_date"])
     ventas["qty"] = pd.to_numeric(ventas["qty"], errors="coerce")
     ventas["net_sale"] = pd.to_numeric(ventas["net_sale"], errors="coerce")
     ventas["prod_nbr"] = ventas["prod_nbr"].astype(str)
