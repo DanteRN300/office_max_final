@@ -612,47 +612,67 @@ def choose_best_scenario(g: pd.DataFrame) -> pd.Series:
 # Descargas y explicación
 # =========================================================
 
+def _series_or_na(df: pd.DataFrame, col: str) -> pd.Series:
+    """Devuelve una columna existente o una serie NA del mismo largo.
+
+    Evita que las descargas se rompan cuando alguna columna opcional no existe
+    por diferencias entre bases o notebooks.
+    """
+    if df is None:
+        return pd.Series(dtype="object")
+    if col in df.columns:
+        return df[col].reset_index(drop=True)
+    return pd.Series([pd.NA] * len(df), dtype="object")
+
+
 def build_pricing_downloads(simulacion: pd.DataFrame, resumen: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Construye los CSV obligatorios de pricing."""
+    """Construye los archivos descargables obligatorios de pricing.
+
+    Esta versión está blindada para bases grandes y para diferencias entre
+    `prod_nbr` y `SKU`. También evita DataFrames corruptos cuando falta una
+    columna opcional.
+    """
     if simulacion is None or simulacion.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     exp = _ensure_sku_alias(simulacion.copy())
+    exp = exp.reset_index(drop=True)
+
     exp_out = pd.DataFrame(
         {
-            "SKU": exp.get("SKU"),
-            "dept_nm": exp.get("dept_nm"),
-            "marca": exp.get("marca"),
-            "tipo_marca": exp.get("tipo_marca"),
-            "categoria_est_socio": exp.get("categoria_est_socio"),
-            "trimestre": exp.get("trimestre"),
-            "escenario aplicado": exp.get("Nombre_Escenario"),
-            "unidades simuladas": exp.get("Unidades_Simuladas"),
-            "ingreso simulado": exp.get("Ingreso_Simulado"),
-            "margen simulado": exp.get("Margen_Simulado"),
-            "mejor escenario": exp.get("Escenario_Ideal"),
-            "categoría de SKU": exp.get("Categoria_RF"),
+            "SKU": _series_or_na(exp, "SKU"),
+            "dept_nm": _series_or_na(exp, "dept_nm"),
+            "marca": _series_or_na(exp, "marca"),
+            "tipo_marca": _series_or_na(exp, "tipo_marca"),
+            "categoria_est_socio": _series_or_na(exp, "categoria_est_socio"),
+            "trimestre": _series_or_na(exp, "trimestre"),
+            "escenario aplicado": _series_or_na(exp, "Nombre_Escenario"),
+            "unidades simuladas": _series_or_na(exp, "Unidades_Simuladas"),
+            "ingreso simulado": _series_or_na(exp, "Ingreso_Simulado"),
+            "margen simulado": _series_or_na(exp, "Margen_Simulado"),
+            "mejor escenario": _series_or_na(exp, "Escenario_Ideal"),
+            "categoría de SKU": _series_or_na(exp, "Categoria_RF"),
         }
     )
 
     if resumen is None or resumen.empty:
         return exp_out, pd.DataFrame()
 
-    best = _ensure_sku_alias(resumen.copy())
+    best = _ensure_sku_alias(resumen.copy()).reset_index(drop=True)
     best_out = pd.DataFrame(
         {
-            "SKU": best.get("SKU"),
-            "trimestre": best.get("trimestre"),
-            "categoría de SKU": best.get("Categoria_RF"),
-            "dept_nm": best.get("dept_nm"),
-            "marca": best.get("marca"),
-            "tipo_marca": best.get("tipo_marca"),
-            "categoria_est_socio": best.get("categoria_est_socio"),
-            "elasticidad": best.get("Elasticidad"),
-            "unidades simuladas": best.get("Unidades_Simuladas_Ideal"),
-            "ingreso simulado": best.get("Ingreso_Simulado_Ideal"),
-            "margen simulado": best.get("Margen_Simulado_Ideal"),
-            "mejor escenario": best.get("Escenario_Ideal"),
+            "SKU": _series_or_na(best, "SKU"),
+            "trimestre": _series_or_na(best, "trimestre"),
+            "categoría de SKU": _series_or_na(best, "Categoria_RF"),
+            "dept_nm": _series_or_na(best, "dept_nm"),
+            "marca": _series_or_na(best, "marca"),
+            "tipo_marca": _series_or_na(best, "tipo_marca"),
+            "categoria_est_socio": _series_or_na(best, "categoria_est_socio"),
+            "elasticidad": _series_or_na(best, "Elasticidad"),
+            "unidades simuladas": _series_or_na(best, "Unidades_Simuladas_Ideal"),
+            "ingreso simulado": _series_or_na(best, "Ingreso_Simulado_Ideal"),
+            "margen simulado": _series_or_na(best, "Margen_Simulado_Ideal"),
+            "mejor escenario": _series_or_na(best, "Escenario_Ideal"),
         }
     )
 
