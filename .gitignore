@@ -1,0 +1,25 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Datos locales pesados
+data/*.csv
+data/*.xlsx
+data/*.xls
+data/*.parquet
+outputs/
+*.zip
+
+# Sistema
+.DS_Store
+Thumbs.db
