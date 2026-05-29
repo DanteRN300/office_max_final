@@ -1,0 +1,10 @@
+[server]
+maxUploadSize = 1024
+headless = true
+
+[client]
+showErrorDetails = false
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
