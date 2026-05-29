@@ -14,7 +14,7 @@ from .config import (
     MIN_PRECIOS_DISTINTOS,
     USE_RANDOM_FOREST_CLASSIFIER,
 )
-from .utils import format_money, format_num, format_pct, normalizar_categoria_est_socio
+from .utils import format_money, format_num, format_pct, normalizar_categoria_est_socio, parse_transaction_dates
 
 
 def _moda_no_vacia(serie: pd.Series):
@@ -57,7 +57,11 @@ def categorize_sku(row: pd.Series) -> str:
 
 
 def _prepare_financial_base(ventas_base: pd.DataFrame, elasticidad_df: pd.DataFrame, bloques: list[dict]) -> pd.DataFrame:
-    """Crea base financiera SKU-trimestre."""
+    """Crea base financiera SKU-trimestre desde la base limpia + NSE.
+
+    ventas_base debe ser la misma base cruzada con NSE que alimentó elasticidad.
+    Así pricing mantiene filtros y descargas por categoria_est_socio y estado.
+    """
     mapa_mes_periodo = {}
     for bloque in bloques:
         for mes in bloque["meses"]:
@@ -71,7 +75,7 @@ def _prepare_financial_base(ventas_base: pd.DataFrame, elasticidad_df: pd.DataFr
     ventas = ventas_base.copy()
 
     if "mes" not in ventas.columns:
-        ventas["mes"] = pd.to_datetime(ventas["tran_date"], errors="coerce").dt.to_period("M")
+        ventas["mes"] = parse_transaction_dates(ventas["tran_date"]).dt.to_period("M")
 
     ventas["periodo_3m"] = ventas["mes"].map(lambda x: mapa_mes_periodo.get(x, {}).get("periodo_3m", np.nan))
     ventas["trimestre"] = ventas["mes"].map(lambda x: mapa_mes_periodo.get(x, {}).get("trimestre", np.nan))
