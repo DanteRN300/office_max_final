@@ -5,6 +5,8 @@ Versión optimizada:
 - La vista 1 solo limpia/cruza/calcula calidad.
 - La elasticidad se calcula únicamente desde la vista 2.
 - Pricing dinámico se calcula únicamente desde la vista 3.
+- La base cruzada con NSE es la base maestra para elasticidad y pricing.
+- Pricing depende explícitamente de la elasticidad SKU × trimestre calculada en la vista 2.
 - Los cálculos pesados se guardan en caché de sesión y las lecturas/gráficas usan st.cache_data para evitar recálculos innecesarios.
 """
 
@@ -246,9 +248,11 @@ def init_state() -> None:
         "elasticity_ready": False,
         "pricing_ready": False,
         "ventas_limpias": pd.DataFrame(),
+        "ventas_nse": pd.DataFrame(),
         "promo_df": None,
         "elasticidad": pd.DataFrame(),
         "ventas_base_elasticidad": pd.DataFrame(),
+        "ventas_base_pricing": pd.DataFrame(),
         "bloques": [],
         "base_pricing": pd.DataFrame(),
         "simulacion": pd.DataFrame(),
@@ -444,7 +448,15 @@ def process_quality_pipeline(
             cache[cache_key] = (ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, nse_info)
 
         st.session_state.quality_cache_key = cache_key
-        st.session_state.ventas_limpias = ventas_nse
+
+        # Base maestra del análisis:
+        # ventas_nse = ventas limpias + cruce NSE.
+        # Esta misma base se usa tanto para elasticidad como para pricing.
+        st.session_state.ventas_nse = ventas_nse
+        st.session_state.ventas_limpias = ventas_nse  # alias para compatibilidad visual
+        st.session_state.ventas_base_elasticidad = ventas_nse
+        st.session_state.ventas_base_pricing = ventas_nse
+
         st.session_state.promo_df = promo_df
         st.session_state.resumen_limpieza = resumen_limpieza
         st.session_state.semaforo = semaforo
@@ -452,6 +464,9 @@ def process_quality_pipeline(
         st.session_state.nse_info = nse_info
         st.session_state.processed = True
         reset_model_results()
+        # reset_model_results limpia derivados; se restaura la base maestra.
+        st.session_state.ventas_base_elasticidad = ventas_nse
+        st.session_state.ventas_base_pricing = ventas_nse
         st.sidebar.success("Base limpia y cruzada con NSE. Elasticidad y pricing se calcularán solo en sus vistas.")
 
     except Exception as exc:
@@ -460,8 +475,14 @@ def process_quality_pipeline(
 
 
 def ensure_elasticity_ready(show_button: bool = True) -> bool:
-    """Calcula elasticidad solo cuando el usuario lo pide o cuando pricing la necesita."""
+    """Calcula elasticidad SKU × trimestre usando la base limpia y cruzada con NSE."""
     if not st.session_state.processed:
+        return False
+
+    if st.session_state.get("ventas_nse") is None or st.session_state.ventas_nse.empty:
+        st.warning(
+            "Primero procesa la base en la vista 1. La elasticidad necesita la base limpia y cruzada con NSE."
+        )
         return False
 
     button_clicked = False
@@ -496,9 +517,9 @@ def ensure_elasticity_ready(show_button: bool = True) -> bool:
         if cache_key in cache:
             elasticidad, ventas_base_elasticidad, bloques = cache[cache_key]
         else:
-            with st.spinner("Calculando elasticidad con caché de sesión..."):
+            with st.spinner("Calculando elasticidad SKU × trimestre usando base cruzada con NSE..."):
                 elasticidad, ventas_base_elasticidad, bloques = calculate_elasticity_cached(
-                    st.session_state.ventas_limpias,
+                    st.session_state.ventas_nse,
                     st.session_state.promo_df,
                 )
             cache.clear()
@@ -519,8 +540,55 @@ def ensure_elasticity_ready(show_button: bool = True) -> bool:
 
 
 def ensure_pricing_ready() -> bool:
-    """Calcula pricing solo cuando el usuario entra a la vista 3 y lo solicita."""
+    """Calcula pricing solo si ya existe elasticidad SKU × trimestre de la misma base NSE.
+
+    Dependencias obligatorias:
+    1. Vista 1 debe generar ventas_nse = ventas limpias + cruce NSE.
+    2. Vista 2 debe calcular elasticidad SKU × trimestre sobre ventas_nse.
+    3. Vista 3 usa ventas_nse + elasticidad; no recalcula elasticidad automáticamente.
+    """
     if not st.session_state.processed:
+        return False
+
+    if st.session_state.get("ventas_nse") is None or st.session_state.ventas_nse.empty:
+        st.warning(
+            "Primero procesa la base en la vista **1. Carga y diagnóstico de datos**. "
+            "Pricing necesita la base limpia y cruzada con NSE."
+        )
+        return False
+
+    required_cols_pricing = ["prod_nbr", "tran_date", "qty", "net_sale", "categoria_est_socio"]
+    missing_cols = [col for col in required_cols_pricing if col not in st.session_state.ventas_nse.columns]
+    if missing_cols:
+        st.error(
+            "La base limpia y cruzada con NSE no tiene las columnas necesarias para pricing: "
+            + ", ".join(missing_cols)
+        )
+        return False
+
+    analysis_key = (
+        st.session_state.get("sales_signature"),
+        st.session_state.get("nse_signature"),
+        st.session_state.get("promo_signature"),
+    )
+
+    if (
+        not st.session_state.get("elasticity_ready", False)
+        or st.session_state.elasticidad is None
+        or st.session_state.elasticidad.empty
+    ):
+        st.warning(
+            "Primero calcula la elasticidad en la vista **2. Elasticidad**. "
+            "La vista de pricing depende de la elasticidad por SKU y trimestre."
+        )
+        return False
+
+    if st.session_state.get("elasticity_cache_key") != analysis_key:
+        st.warning(
+            "La elasticidad guardada no corresponde a la base actual de ventas + NSE + promociones. "
+            "Vuelve a calcular elasticidad en la vista **2. Elasticidad** antes de calcular pricing."
+        )
+        st.session_state.pricing_ready = False
         return False
 
     col_a, col_b = st.columns([1, 2])
@@ -532,7 +600,8 @@ def ensure_pricing_ready() -> bool:
         )
     with col_b:
         st.caption(
-            "Pricing depende de elasticidad. Si todavía no existe, la app la calcula una vez usando caché."
+            "Pricing usa la base limpia + NSE y la elasticidad SKU × trimestre ya calculada. "
+            "Cambiar filtros no recalcula elasticidad ni vuelve a simular todo."
         )
 
     if st.session_state.pricing_ready and not button_clicked:
@@ -543,38 +612,14 @@ def ensure_pricing_ready() -> bool:
         return False
 
     try:
-        elasticity_key = (
-            st.session_state.get("sales_signature"),
-            st.session_state.get("nse_signature"),
-            st.session_state.get("promo_signature"),
-        )
-
-        if not st.session_state.elasticity_ready:
-            cache_el = st.session_state.manual_cache.setdefault("elasticity", {})
-            if elasticity_key in cache_el:
-                elasticidad, ventas_base_elasticidad, bloques = cache_el[elasticity_key]
-            else:
-                with st.spinner("Calculando elasticidad necesaria para pricing..."):
-                    elasticidad, ventas_base_elasticidad, bloques = calculate_elasticity_cached(
-                        st.session_state.ventas_limpias,
-                        st.session_state.promo_df,
-                    )
-                cache_el.clear()
-                cache_el[elasticity_key] = (elasticidad, ventas_base_elasticidad, bloques)
-            st.session_state.elasticidad = elasticidad
-            st.session_state.ventas_base_elasticidad = ventas_base_elasticidad
-            st.session_state.bloques = bloques
-            st.session_state.elasticity_cache_key = elasticity_key
-            st.session_state.elasticity_ready = True
-
-        pricing_key = (elasticity_key, "pricing_v2_vectorizado")
+        pricing_key = (analysis_key, "pricing_depende_ventas_nse_y_elasticidad_sku_trimestre")
         cache_pr = st.session_state.manual_cache.setdefault("pricing", {})
         if pricing_key in cache_pr:
             base_pricing, simulacion, resumen_pricing = cache_pr[pricing_key]
         else:
-            with st.spinner("Simulando escenarios de pricing con caché de sesión..."):
+            with st.spinner("Simulando escenarios de pricing con base NSE + elasticidad SKU-trimestre..."):
                 base_pricing, simulacion, resumen_pricing = simulate_pricing_cached(
-                    st.session_state.ventas_base_elasticidad,
+                    st.session_state.ventas_nse,
                     st.session_state.elasticidad,
                     st.session_state.bloques,
                 )
@@ -586,13 +631,13 @@ def ensure_pricing_ready() -> bool:
         st.session_state.simulacion = simulacion
         st.session_state.resumen_pricing = resumen_pricing
         st.session_state.pricing_ready = True
-        st.success("Pricing calculado correctamente. Cambiar filtros no volverá a simular todo.")
+        st.session_state.ventas_base_pricing = st.session_state.ventas_nse
+        st.success("Pricing calculado correctamente usando base NSE + elasticidad SKU-trimestre.")
         return True
     except Exception as exc:
         st.session_state.pricing_ready = False
         st.error(f"No se pudo calcular pricing dinámico: {exc}")
         return False
-
 
 def require_processed() -> bool:
     """Valida que haya datos procesados."""
@@ -624,7 +669,7 @@ def render_quality_view() -> None:
     if not require_processed():
         return
 
-    ventas = st.session_state.ventas_limpias
+    ventas = st.session_state.ventas_nse
     semaforo = st.session_state.semaforo
     resumen_limpieza = st.session_state.resumen_limpieza
     calidad_varianza = st.session_state.calidad_varianza
@@ -848,6 +893,10 @@ def render_pricing_view() -> None:
     """Vista 3: pricing dinámico y proyección."""
     st.title("3. Pricing dinámico + proyección de ventas")
     st.caption("Simulación de escenarios, KPIs, proyección y recomendación del mejor escenario.")
+    st.info(
+        "Esta vista depende de dos insumos: **base limpia + NSE** y **elasticidad SKU × trimestre**. "
+        "Si cambias ventas, promociones o NSE, recalcula elasticidad antes de pricing."
+    )
 
     if not require_processed():
         return
