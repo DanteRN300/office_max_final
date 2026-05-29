@@ -235,6 +235,70 @@ def aggregate_pricing_chart_data(selected: pd.DataFrame) -> tuple[pd.DataFrame, 
     return money_long, qty_long, im_long
 
 
+def _safe_sorted_options(df: pd.DataFrame, col: str | None) -> list[str]:
+    """Devuelve opciones limpias y ordenadas para filtros dependientes."""
+    if df is None or df.empty or col is None or col not in df.columns:
+        return []
+    values = (
+        df[col]
+        .dropna()
+        .astype(str)
+        .map(str.strip)
+    )
+    values = values[values != ""]
+    return sorted(values.unique().tolist())
+
+
+def _filter_fast(df: pd.DataFrame, col: str | None, value: object) -> pd.DataFrame:
+    """Filtro ligero para cascadas de Streamlit sin copiar todo el DataFrame si no hace falta."""
+    if df is None or df.empty or col is None or col not in df.columns or value in [None, "Todos", "Todas"]:
+        return df
+    return df.loc[df[col].astype(str) == str(value)]
+
+
+def _dependent_selectbox(
+    label: str,
+    options: list[str],
+    key: str,
+    default: str,
+    container,
+) -> str:
+    """Selectbox que se resetea si una selección previa ya no existe por filtros anteriores."""
+    if not options:
+        options = [default]
+    if default not in options:
+        options = [default] + options
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = default
+    with container:
+        return st.selectbox(label, options, key=key)
+
+
+def _df_to_excel_friendly_csv_bytes(df: pd.DataFrame, sep: str = ";") -> bytes:
+    """CSV compatible con Excel en configuración regional de México/España.
+
+    Usa UTF-8 con BOM y separador `;` para que Excel abra columnas correctamente.
+    """
+    if df is None or df.empty:
+        return b""
+    clean = df.copy()
+    return clean.to_csv(index=False, sep=sep, encoding="utf-8-sig", lineterminator="\n").encode("utf-8-sig")
+
+
+def _dataframes_to_zip_csv_bytes(files: dict[str, pd.DataFrame], sep: str = ";") -> bytes:
+    """Empaqueta uno o varios DataFrames como CSV dentro de un ZIP en memoria."""
+    import io
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for filename, df in files.items():
+            csv_bytes = _df_to_excel_friendly_csv_bytes(df, sep=sep)
+            zf.writestr(filename, csv_bytes)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # =========================================================
 # Estado de la app
 # =========================================================
@@ -890,12 +954,22 @@ def render_elasticity_view() -> None:
 
 
 def render_pricing_view() -> None:
-    """Vista 3: pricing dinámico y proyección."""
+    """Vista 3: pricing dinámico y proyección.
+
+    Iteraciones aplicadas:
+    - Se quitaron los filtros de estado y nivel socioeconómico de la interfaz.
+    - La dependencia de filtros queda en este orden:
+      1) Categoría de SKU -> 2) Departamento -> 3) Trimestre -> 4) SKU.
+    - Cada filtro delimita automáticamente las opciones de los siguientes.
+    - La descarga completa se prepara bajo demanda y se entrega como ZIP con CSV,
+      para evitar archivos corruptos o demasiado pesados en Streamlit/Excel.
+    """
     st.title("3. Pricing dinámico + proyección de ventas")
     st.caption("Simulación de escenarios, KPIs, proyección y recomendación del mejor escenario.")
     st.info(
         "Esta vista depende de dos insumos: **base limpia + NSE** y **elasticidad SKU × trimestre**. "
-        "Si cambias ventas, promociones o NSE, recalcula elasticidad antes de pricing."
+        "Los filtros visibles son categoría, departamento, trimestre y SKU. "
+        "El NSE sigue dentro de la base para el análisis, pero ya no aparece como filtro en esta vista."
     )
 
     if not require_processed():
@@ -911,48 +985,89 @@ def render_pricing_view() -> None:
     sim = st.session_state.simulacion
     resumen = st.session_state.resumen_pricing
 
-    if sim.empty:
+    if sim is None or sim.empty:
         st.warning("No hay simulaciones de pricing. Revisa elasticidad, costos y bloques trimestrales.")
         return
 
+    # Validaciones mínimas para evitar errores por columnas faltantes.
+    required_filter_cols = ["Categoria_RF", "trimestre", "SKU", "Nombre_Escenario"]
+    missing = [c for c in required_filter_cols if c not in sim.columns]
+    if missing:
+        st.error(
+            "La tabla de simulaciones no tiene las columnas necesarias para la vista de pricing: "
+            + ", ".join(missing)
+        )
+        return
+
     st.subheader("Filtros")
+    st.caption(
+        "Orden de dependencia: **Categoría de SKU → Departamento → Trimestre → SKU**. "
+        "Al cambiar un filtro, los siguientes muestran únicamente opciones válidas."
+    )
 
-    f1, f2, f3 = st.columns(3)
-    with f1:
-        cat_options = ["Todas"] + sorted(sim["Categoria_RF"].dropna().astype(str).unique().tolist())
-        categoria = st.selectbox("Categoría de SKU", cat_options)
-    df_cat = filter_dataframe_dependently(sim, {"Categoria_RF": categoria})
+    f1, f2, f3, f4 = st.columns(4)
 
-    with f2:
-        tri_options = ["Todos"] + sorted(df_cat["trimestre"].dropna().astype(str).unique().tolist())
-        trimestre = st.selectbox("Trimestre", tri_options)
-    df_tri = filter_dataframe_dependently(df_cat, {"trimestre": trimestre})
+    # 1) Categoría de SKU
+    cat_options = ["Todas"] + _safe_sorted_options(sim, "Categoria_RF")
+    categoria = _dependent_selectbox(
+        label="1. Categoría de SKU",
+        options=cat_options,
+        key="pricing_filter_categoria",
+        default="Todas",
+        container=f1,
+    )
+    df_cat = _filter_fast(sim, "Categoria_RF", categoria)
 
-    with f3:
-        dept_options = ["Todos"] + sorted(df_tri["dept_nm"].dropna().astype(str).unique().tolist()) if "dept_nm" in df_tri.columns else ["Todos"]
-        dept = st.selectbox("Departamento", dept_options)
-    df_dept = filter_dataframe_dependently(df_tri, {"dept_nm": dept})
+    # 2) Departamento, delimitado por categoría.
+    dept_col = "dept_nm" if "dept_nm" in df_cat.columns else None
+    dept_options = ["Todos"] + (_safe_sorted_options(df_cat, dept_col) if dept_col else [])
+    dept = _dependent_selectbox(
+        label="2. Departamento",
+        options=dept_options,
+        key="pricing_filter_departamento",
+        default="Todos",
+        container=f2,
+    )
+    df_dept = _filter_fast(df_cat, dept_col, dept) if dept_col else df_cat
 
-    f4, f5, f6 = st.columns(3)
-    with f4:
-        estado_options = ["Todos"] + sorted(df_dept["estado"].dropna().astype(str).unique().tolist()) if "estado" in df_dept.columns else ["Todos"]
-        estado = st.selectbox("Estado", estado_options)
-    df_estado = filter_dataframe_dependently(df_dept, {"estado": estado})
+    # 3) Trimestre, delimitado por categoría + departamento.
+    tri_options = ["Todos"] + _safe_sorted_options(df_dept, "trimestre")
+    trimestre = _dependent_selectbox(
+        label="3. Trimestre",
+        options=tri_options,
+        key="pricing_filter_trimestre",
+        default="Todos",
+        container=f3,
+    )
+    df_tri = _filter_fast(df_dept, "trimestre", trimestre)
 
-    with f5:
-        nse_options = ["Todos"] + sorted(df_estado["categoria_est_socio"].dropna().astype(str).unique().tolist()) if "categoria_est_socio" in df_estado.columns else ["Todos"]
-        nse = st.selectbox("Nivel socioeconómico", nse_options)
-    df_nse = filter_dataframe_dependently(df_estado, {"categoria_est_socio": nse})
+    # 4) SKU, delimitado por categoría + departamento + trimestre.
+    sku_options = ["Todos"] + _safe_sorted_options(df_tri, "SKU")
+    sku = _dependent_selectbox(
+        label="4. SKU",
+        options=sku_options,
+        key="pricing_filter_sku",
+        default="Todos",
+        container=f4,
+    )
+    df_sku = _filter_fast(df_tri, "SKU", sku)
 
-    sku_options = sorted(df_nse["SKU"].dropna().astype(str).unique().tolist())
-    with f6:
-        sku = st.selectbox("SKU", ["Todos"] + sku_options)
+    if df_sku.empty:
+        st.warning("No hay resultados para la combinación de filtros seleccionada.")
+        return
 
-    df_sku = filter_dataframe_dependently(df_nse, {"SKU": sku})
+    # Escenario: se filtra después de la cascada principal.
+    escenario_options = _safe_sorted_options(df_sku, "Nombre_Escenario")
+    if not escenario_options:
+        escenario_options = ESCENARIOS_PRICING["Nombre_Escenario"].astype(str).tolist()
 
-    escenario_options = ESCENARIOS_PRICING["Nombre_Escenario"].tolist()
-    escenario = st.selectbox("Escenario de pricing", escenario_options)
-    selected = df_sku[df_sku["Nombre_Escenario"] == escenario]
+    escenario = st.selectbox(
+        "Escenario de pricing",
+        escenario_options,
+        key="pricing_filter_escenario",
+    )
+
+    selected = _filter_fast(df_sku, "Nombre_Escenario", escenario)
 
     if selected.empty:
         st.warning("No hay resultados para la combinación de filtros y escenario seleccionado.")
@@ -960,22 +1075,30 @@ def render_pricing_view() -> None:
 
     card1, card2 = st.columns(2)
     with card1:
-        cat_sel = selected["Categoria_RF"].dropna().mode().iloc[0] if not selected["Categoria_RF"].dropna().mode().empty else "Sin categoría"
-        render_kpi_card("Categoría del SKU/grupo", cat_sel, "Según reglas o RF conservador")
+        cat_sel = (
+            selected["Categoria_RF"].dropna().mode().iloc[0]
+            if "Categoria_RF" in selected.columns and not selected["Categoria_RF"].dropna().mode().empty
+            else "Sin categoría"
+        )
+        render_kpi_card("Categoría del SKU/grupo", cat_sel, "Según reglas de elasticidad y rentabilidad")
     with card2:
         if sku != "Todos":
-            best = resumen[resumen["SKU"].astype(str) == str(sku)]
-            if trimestre != "Todos":
-                best = best[best["trimestre"].astype(str) == str(trimestre)]
-            best_scen = best["Escenario_Ideal"].iloc[0] if not best.empty else "Sin dato"
+            best = resumen.copy() if resumen is not None else pd.DataFrame()
+            if not best.empty and "SKU" in best.columns:
+                best = best[best["SKU"].astype(str) == str(sku)]
+                if trimestre != "Todos" and "trimestre" in best.columns:
+                    best = best[best["trimestre"].astype(str) == str(trimestre)]
+                best_scen = best["Escenario_Ideal"].iloc[0] if "Escenario_Ideal" in best.columns and not best.empty else "Sin dato"
+            else:
+                best_scen = "Sin dato"
             render_kpi_card("Mejor escenario", best_scen, "Para el SKU seleccionado")
         else:
             render_kpi_card("Mejor escenario", "Selecciona un SKU", "Disponible por SKU")
 
     st.subheader("KPIs proyectados")
-    unidades = selected["Unidades_Simuladas"].sum()
-    ingreso = selected["Ingreso_Simulado"].sum()
-    margen = selected["Margen_Simulado"].sum()
+    unidades = selected["Unidades_Simuladas"].sum() if "Unidades_Simuladas" in selected.columns else 0
+    ingreso = selected["Ingreso_Simulado"].sum() if "Ingreso_Simulado" in selected.columns else 0
+    margen = selected["Margen_Simulado"].sum() if "Margen_Simulado" in selected.columns else 0
 
     k1, k2, k3 = st.columns(3)
     with k1:
@@ -988,18 +1111,48 @@ def render_pricing_view() -> None:
     money_long, qty_long, im_long = aggregate_pricing_chart_data(selected)
 
     st.subheader("Ventas en dinero")
-    fig = px.line(money_long, x="trimestre", y="Ventas", color="Serie", markers=True, title="Ventas normales vs ventas simuladas")
-    st.plotly_chart(fig, use_container_width=True)
+    if not money_long.empty:
+        fig = px.line(
+            money_long,
+            x="trimestre",
+            y="Ventas",
+            color="Serie",
+            markers=True,
+            title="Ventas normales vs ventas simuladas",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("No hay datos suficientes para graficar ventas en dinero.")
     st.caption(build_dynamic_explanation_pricing(selected, escenario, None if sku == "Todos" else sku))
 
     st.subheader("Ventas en cantidad")
-    fig = px.line(qty_long, x="trimestre", y="Unidades", color="Serie", markers=True, title="Cantidad normal vs cantidad simulada")
-    st.plotly_chart(fig, use_container_width=True)
+    if not qty_long.empty:
+        fig = px.line(
+            qty_long,
+            x="trimestre",
+            y="Unidades",
+            color="Serie",
+            markers=True,
+            title="Cantidad normal vs cantidad simulada",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("No hay datos suficientes para graficar ventas en cantidad.")
     st.caption(build_dynamic_explanation_pricing(selected, escenario, None if sku == "Todos" else sku))
 
     st.subheader("Ingreso vs margen")
-    fig = px.bar(im_long, x="trimestre", y="Monto", color="Métrica", barmode="group", title="Ingreso simulado vs margen simulado")
-    st.plotly_chart(fig, use_container_width=True)
+    if not im_long.empty:
+        fig = px.bar(
+            im_long,
+            x="trimestre",
+            y="Monto",
+            color="Métrica",
+            barmode="group",
+            title="Ingreso simulado vs margen simulado",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("No hay datos suficientes para graficar ingreso vs margen.")
     st.caption(build_dynamic_explanation_pricing(selected, escenario, None if sku == "Todos" else sku))
 
     st.subheader("Conclusión personalizada")
@@ -1011,6 +1164,7 @@ def render_pricing_view() -> None:
             "trimestre",
             "Nombre_Escenario",
             "Categoria_RF",
+            "dept_nm",
             "Elasticidad",
             "R2",
             "P_Value",
@@ -1025,23 +1179,75 @@ def render_pricing_view() -> None:
         st.dataframe(selected[[c for c in cols if c in selected.columns]], use_container_width=True)
 
     st.subheader("Descargas")
-    exp_csv, best_csv = build_pricing_downloads(sim, resumen)
+    st.caption(
+        "Para evitar archivos corruptos o muy pesados, los archivos se preparan solo cuando presionas el botón. "
+        "El archivo completo de todos los escenarios se descarga como ZIP con un CSV adentro."
+    )
 
-    d1, d2 = st.columns(2)
-    with d1:
-        st.download_button(
-            "Descargar CSV completo con todos los experimentos",
-            data=convert_df_to_csv(exp_csv),
-            file_name="pricing_todos_los_escenarios.csv",
-            mime="text/csv",
-        )
-    with d2:
-        st.download_button(
-            "Descargar CSV con mejor escenario",
-            data=convert_df_to_csv(best_csv),
-            file_name="pricing_mejor_escenario.csv",
-            mime="text/csv",
-        )
+    download_key = st.session_state.get("pricing_cache_key")
+    prepared_key = st.session_state.get("pricing_download_key")
+    downloads_ready = prepared_key == download_key and st.session_state.get("pricing_full_zip_bytes") is not None
+
+    if st.button("Preparar archivos de descarga", use_container_width=True):
+        try:
+            with st.spinner("Preparando archivos de descarga..."):
+                exp_csv, best_csv = build_pricing_downloads(sim, resumen)
+
+                if exp_csv is None or exp_csv.empty:
+                    st.warning("No se pudo construir el archivo completo porque la tabla de simulaciones está vacía.")
+                    st.session_state.pricing_download_key = None
+                    st.session_state.pricing_full_zip_bytes = None
+                    st.session_state.pricing_best_csv_bytes = None
+                else:
+                    st.session_state.pricing_full_zip_bytes = _dataframes_to_zip_csv_bytes(
+                        {
+                            "pricing_todos_los_escenarios.csv": exp_csv,
+                        },
+                        sep=";",
+                    )
+                    st.session_state.pricing_best_csv_bytes = _df_to_excel_friendly_csv_bytes(best_csv, sep=";")
+                    st.session_state.pricing_download_rows = len(exp_csv)
+                    st.session_state.pricing_best_rows = len(best_csv) if best_csv is not None else 0
+                    st.session_state.pricing_download_key = download_key
+                    st.success("Archivos preparados correctamente.")
+        except Exception as exc:
+            st.error(f"No se pudieron preparar las descargas: {exc}")
+            st.session_state.pricing_download_key = None
+            st.session_state.pricing_full_zip_bytes = None
+            st.session_state.pricing_best_csv_bytes = None
+
+    prepared_key = st.session_state.get("pricing_download_key")
+    downloads_ready = prepared_key == download_key and st.session_state.get("pricing_full_zip_bytes") is not None
+
+    if downloads_ready:
+        rows_full = st.session_state.get("pricing_download_rows", 0)
+        if rows_full > 1_048_576:
+            st.warning(
+                f"El archivo completo tiene {rows_full:,} filas. Excel tiene un límite aproximado de 1,048,576 filas por hoja. "
+                "El CSV está completo dentro del ZIP, pero para bases muy grandes conviene abrirlo en Power BI, Python, Tableau o dividirlo por filtros."
+            )
+
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "Descargar ZIP con CSV completo de todos los escenarios",
+                data=st.session_state.pricing_full_zip_bytes,
+                file_name="pricing_todos_los_escenarios.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        with d2:
+            best_bytes = st.session_state.get("pricing_best_csv_bytes") or b""
+            st.download_button(
+                "Descargar CSV con mejor escenario",
+                data=best_bytes,
+                file_name="pricing_mejor_escenario.csv",
+                mime="text/csv; charset=utf-8",
+                use_container_width=True,
+                disabled=not bool(best_bytes),
+            )
+    else:
+        st.info("Presiona **Preparar archivos de descarga** para generar los archivos.")
 
 
 # =========================================================
