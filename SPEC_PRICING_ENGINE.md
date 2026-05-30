@@ -1,6 +1,6 @@
 Actúa como ingeniero senior de datos, machine learning, pricing analytics y frontend. Necesito que audites y modifiques este repositorio de una app de pricing dinámico para retail de papelería tipo OfficeMax / Office Depot.
 
-La app ya existe. Actualmente tiene una primera vista donde se cargan bases de datos, se cruza una base de ventas con una base de nivel socioeconómico, se hace limpieza de datos y se genera un diagnóstico de calidad de la base. También existe una lógica de elasticidad histórica y pricing dinámico, pero necesito reestructurar la arquitectura, mejorar la lógica de modelos, separar claramente pricing histórico de pricing futuro y agregar escenarios promocionales.
+La app ya existe. Actualmente tiene una primera vista donde se cargan bases de datos, se cruza una base de ventas con una base de nivel socioeconómico, se hace limpieza de datos y se genera un diagnóstico de calidad de la base. También existe una lógica de elasticidad histórica y pricing dinámico, pero necesito reestructurar la arquitectura, mejorar la lógica de modelos, separar claramente pricing histórico de pricing futuro, agregar escenarios promocionales y mejorar el manejo de las bases NSE.
 
 No reescribas todo desde cero. Primero audita el repositorio, identifica la tecnología usada, detecta archivos principales y después implementa cambios por fases. La prioridad es que la app quede correcta, robusta, explicable y eficiente.
 
@@ -11,25 +11,29 @@ OBJETIVO GENERAL
 Convertir la app actual en un motor de pricing dinámico basado en:
 
 1. Calidad de datos.
-2. Elasticidad histórica multi-periodo.
-3. Simulación histórica de escenarios de precio.
-4. Proyección futura de demanda base.
-5. Simulación futura de pricing a 1 y 3 meses.
-6. Recomendación explicable por SKU.
-7. Escenarios promocionales como 2x1, 3x2 y segundo producto al 50%.
-8. Exportables claros y válidos.
-9. Filtros dependientes y dashboard ejecutivo.
+2. Cruce robusto con nivel socioeconómico.
+3. Bases NSE default precargadas.
+4. Opción de subir bases NSE personalizadas.
+5. Elasticidad histórica multi-periodo.
+6. Simulación histórica de escenarios de precio.
+7. Proyección futura de demanda base.
+8. Simulación futura de pricing a 1 y 3 meses.
+9. Recomendación explicable por SKU.
+10. Escenarios promocionales como 2x1, 3x2 y segundo producto al 50%.
+11. Exportables claros y válidos.
+12. Filtros dependientes y dashboard ejecutivo.
 
 La app debe quedar dividida conceptualmente en estos módulos:
 
 1. Data Quality Engine.
-2. Elasticity Engine.
-3. Historical Pricing Simulator.
-4. Demand Forecast Engine.
-5. Future Pricing Simulator.
-6. Recommendation Engine.
-7. Executive Dashboard.
-8. Exportables.
+2. NSE Configuration Engine.
+3. Elasticity Engine.
+4. Historical Pricing Simulator.
+5. Demand Forecast Engine.
+6. Future Pricing Simulator.
+7. Recommendation Engine.
+8. Executive Dashboard.
+9. Exportables.
 
 ============================================================
 FASE 0 — AUDITORÍA INICIAL DEL REPOSITORIO
@@ -42,6 +46,7 @@ Antes de modificar código, revisa el repositorio completo e identifica:
 * Archivos que controlan carga de datos.
 * Archivos que hacen limpieza.
 * Archivos que hacen cruce con nivel socioeconómico.
+* Archivos que cargan las bases NSE actuales.
 * Archivos que calculan elasticidad.
 * Archivos que calculan pricing dinámico.
 * Archivos que generan dashboards, filtros y descargas.
@@ -59,7 +64,9 @@ Antes de modificar código, revisa el repositorio completo e identifica:
   * departamento
   * tienda
   * estado
+  * municipio
   * nivel socioeconómico
+  * categoría socioeconómica
   * tipo de marca
   * promociones
   * inventario, si existe
@@ -72,6 +79,9 @@ Detecta posibles errores por columnas faltantes, especialmente errores tipo:
 * "unidades"
 * "costo_unitario"
 * "margen"
+* "store_nm"
+* "estado"
+* "municipio"
 
 Entrega primero un resumen de auditoría con:
 
@@ -79,7 +89,8 @@ Entrega primero un resumen de auditoría con:
 2. Archivos que se modificarían.
 3. Columnas clave encontradas.
 4. Riesgos actuales del código.
-5. Plan de implementación por fases.
+5. Cómo se están usando actualmente las bases NSE.
+6. Plan de implementación por fases.
 
 No implementes todo hasta haber identificado bien la estructura.
 
@@ -153,6 +164,264 @@ El semáforo de calidad debe funcionar así:
 * Rojo: base no confiable para recomendaciones automáticas.
 
 No elimines funcionalidad actual de esta vista. Solo hazla más robusta, más ordenada y evita que columnas clave se pierdan.
+
+============================================================
+FASE 1.1 — NSE CONFIGURATION ENGINE
+===================================
+
+Actualmente el cruce con nivel socioeconómico utiliza dos archivos base para generar la asignación de NSE. Por facilidad de uso, la app debe incluir estas bases NSE precargadas por default, pero también debe permitir que el usuario suba una versión editada si el negocio quiere ajustar alguna asignación de NSE.
+
+Objetivo:
+
+La app debe funcionar aunque el usuario solo cargue la base de ventas. Las bases necesarias para el cruce NSE deben estar disponibles por default dentro del proyecto. Sin embargo, también debe existir la opción de reemplazarlas o editarlas mediante carga manual.
+
+---
+
+1. Bases NSE default
+
+---
+
+La app debe tener precargadas las bases necesarias para el cruce NSE.
+
+Estas bases pueden estar guardadas en una carpeta del proyecto, por ejemplo:
+
+* data/default_nse/
+* static/data/default_nse/
+* assets/nse/
+* public/data/nse/
+
+Usar la estructura que mejor se adapte al framework actual de la app.
+
+La app debe cargar estas bases por default si el usuario no sube archivos NSE personalizados.
+
+Agregar una variable o indicador llamado:
+
+fuente_nse
+
+Valores posibles:
+
+* "default"
+* "personalizada"
+
+Si el usuario no sube base NSE, entonces:
+
+fuente_nse = "default"
+
+Si el usuario sube una base NSE editada, entonces:
+
+fuente_nse = "personalizada"
+
+---
+
+2. Opción para subir base NSE personalizada
+
+---
+
+Agregar en la vista de carga de datos una sección llamada:
+
+"Configuración de nivel socioeconómico"
+
+Debe tener estas opciones:
+
+* Usar base NSE default
+* Subir base NSE personalizada
+
+La opción default debe ser:
+
+"Usar base NSE default"
+
+Si el usuario elige subir base NSE personalizada, permitir subir los archivos necesarios para reemplazar las bases NSE default.
+
+La app debe explicar brevemente:
+
+"Usa esta opción si el negocio quiere ajustar la asignación de nivel socioeconómico por tienda, zona, municipio, AGEB, estado u otra unidad geográfica."
+
+---
+
+3. Validación de base NSE personalizada
+
+---
+
+Antes de usar una base NSE personalizada, validar:
+
+* que el archivo no esté vacío
+* que tenga las columnas necesarias para el cruce
+* que no tenga claves duplicadas problemáticas
+* que no tenga demasiados valores nulos en columnas clave
+* que las columnas de unión coincidan con las columnas de la base de ventas
+* que el formato sea compatible
+* que el número de registros sea razonable
+* que la asignación NSE tenga valores válidos
+
+Si la base NSE personalizada no pasa la validación:
+
+* mostrar advertencia clara
+* no romper la app
+* usar automáticamente la base NSE default como fallback
+* indicar en el diagnóstico que la base personalizada fue rechazada
+
+Agregar una columna o indicador:
+
+estado_validacion_nse
+
+Valores posibles:
+
+* "válida"
+* "inválida"
+* "usada_default_por_fallback"
+
+---
+
+4. Cruce con NSE
+
+---
+
+El cruce con NSE debe funcionar con:
+
+* bases NSE default
+* bases NSE personalizadas
+
+La lógica de cruce debe ser la misma, solamente cambia la fuente de datos.
+
+Después del cruce, asegurar que no se pierdan columnas clave como:
+
+* SKU
+* fecha
+* precio
+* unidades
+* ingreso
+* costo
+* margen
+* categoría
+* departamento
+* tienda
+* estado
+* nivel socioeconómico
+* categoria_est_socio, si existe
+
+---
+
+5. Diagnóstico del cruce NSE
+
+---
+
+Agregar al diagnóstico de calidad indicadores específicos del cruce NSE:
+
+* fuente_nse usada: default o personalizada
+* registros de ventas antes del cruce
+* registros de ventas después del cruce
+* porcentaje de registros con NSE asignado
+* porcentaje de registros sin NSE asignado
+* tiendas con NSE asignado
+* tiendas sin NSE asignado
+* categorías socioeconómicas detectadas
+* valores nulos en NSE
+* advertencias del cruce
+
+Si hay registros sin NSE asignado, no eliminar automáticamente esos registros. Marcar como:
+
+"NSE_no_asignado"
+
+o equivalente.
+
+---
+
+6. Edición desde perspectiva de negocio
+
+---
+
+La base NSE personalizada debe permitir que el negocio modifique asignaciones cuando considere que la clasificación automática no representa bien la realidad comercial.
+
+Ejemplo:
+
+Una tienda puede estar ubicada en una zona con cierto NSE, pero por comportamiento de compra, ticket promedio o estrategia comercial, el negocio puede querer reclasificarla.
+
+Por eso, el sistema debe permitir una base NSE personalizada sin cambiar el código.
+
+---
+
+7. Trazabilidad
+
+---
+
+Agregar en los resultados y exportables la fuente del NSE usado.
+
+En ventas_limpias agregar, si aplica:
+
+* fuente_nse
+* nse_asignado
+* categoria_est_socio
+* nse_match_status
+
+Valores sugeridos para nse_match_status:
+
+* "match_default"
+* "match_personalizado"
+* "sin_match"
+* "fallback_default"
+
+En diagnostico_calidad agregar:
+
+* fuente_nse_usada
+* estado_validacion_nse
+* porcentaje_match_nse
+* registros_sin_match_nse
+* advertencias_nse
+
+---
+
+8. Exportables NSE
+
+---
+
+Los exportables deben incluir información de NSE:
+
+* ventas_limpias debe incluir la categoría NSE asignada
+* diagnostico_calidad debe incluir fuente_nse y calidad del cruce
+* recomendaciones_sku debe conservar variables NSE si se usan en filtros o análisis
+* si se usa base NSE personalizada, indicar en el exportable que los resultados dependen de una asignación personalizada
+
+---
+
+9. UX recomendada
+
+---
+
+En la primera vista de carga de datos, mostrar:
+
+Sección: "Nivel socioeconómico"
+
+Opciones:
+
+[●] Usar base NSE default
+[ ] Subir base NSE personalizada
+
+Si se selecciona "Subir base NSE personalizada", mostrar uploader de archivos.
+
+Después del cruce, mostrar una tarjeta resumen:
+
+* Fuente NSE usada: Default / Personalizada
+* % registros con NSE asignado
+* Tiendas sin NSE asignado
+* Advertencias del cruce
+
+---
+
+10. Criterios de aceptación específicos NSE
+
+---
+
+La implementación es correcta si:
+
+* La app funciona sin que el usuario suba bases NSE.
+* La app usa bases NSE default automáticamente.
+* El usuario puede subir bases NSE personalizadas.
+* La app valida las bases NSE personalizadas.
+* Si la base personalizada falla, la app usa default como fallback.
+* El diagnóstico indica claramente si se usó NSE default o personalizado.
+* El cruce NSE no rompe columnas clave.
+* Los registros sin match NSE no se eliminan automáticamente.
+* Los exportables indican la fuente NSE usada.
 
 ============================================================
 FASE 2 — ELASTICITY ENGINE MULTI-PERIODO
@@ -863,6 +1132,9 @@ La app debe tener vistas o secciones claras:
 Debe incluir:
 
 * carga de archivos
+* configuración de NSE
+* opción de usar NSE default
+* opción de subir NSE personalizada
 * limpieza
 * cruce NSE
 * semáforo de calidad
@@ -870,6 +1142,7 @@ Debe incluir:
 * resumen de varianza
 * nulos
 * cobertura histórica
+* resumen de calidad del cruce NSE
 
 ---
 
@@ -1098,6 +1371,13 @@ En pricing_historico_escenarios y pricing_futuro_escenarios deben aparecer:
 * estrategia_especifica
 * razon_recomendacion
 
+Los exportables también deben incluir información de NSE cuando aplique:
+
+* fuente_nse
+* nse_asignado
+* categoria_est_socio
+* nse_match_status
+
 ============================================================
 FASE 12 — VALIDACIONES Y EDGE CASES
 ===================================
@@ -1128,6 +1408,10 @@ Agregar validaciones para:
 * outliers extremos de unidades
 * archivos vacíos
 * columnas con nombres distintos a los esperados
+* base NSE default no encontrada
+* base NSE personalizada inválida
+* columnas NSE faltantes
+* registros sin match NSE
 
 Nunca dejar que la app truene por uno de estos casos.
 
@@ -1154,29 +1438,36 @@ La implementación se considera correcta si:
 2. El cruce con NSE no rompe columnas clave.
 3. Existe una salida clara de ventas_limpias.
 4. Existe diagnostico_calidad con semáforo.
-5. La elasticidad puede calcularse por mes, trimestre, semestre, año y global SKU.
-6. La elasticidad trimestral actual se conserva.
-7. Se separa claramente Pricing Histórico de Pricing Futuro.
-8. Pricing Histórico permite simular escenarios pasados.
-9. Pricing Histórico incluye 2x1, 3x2 y segundo al 50%.
-10. Pricing Futuro permite elegir horizonte de 1 mes o 3 meses.
-11. Pricing Futuro permite elegir método de proyección.
-12. El método default es Automático recomendado.
-13. La demanda base futura se calcula antes de aplicar elasticidad.
-14. Los escenarios futuros calculan unidades, ingreso y margen simulados.
-15. Pricing Futuro incluye 2x1, 3x2 y segundo al 50%.
-16. La recomendación final no depende únicamente del Random Forest.
-17. El Random Forest, si se conserva, funciona como apoyo para riesgo/confianza o probabilidad de éxito.
-18. Cada recomendación tiene explicación textual.
-19. Existen categoria_recomendacion y estrategia_especifica.
-20. Los filtros dependientes funcionan en orden categoría → departamento → periodo/horizonte → SKU.
-21. Los exportables descargan archivos válidos.
-22. La app no recalcula procesos pesados innecesariamente.
-23. No hay errores por columnas faltantes tipo "SKU".
-24. La app maneja NaN, infinitos y datos insuficientes sin romperse.
-25. El código queda organizado y comentado.
-26. La app corre localmente.
-27. La app sigue funcionando en el entorno de despliegue actual.
+5. La app funciona con bases NSE default precargadas.
+6. El usuario puede subir bases NSE personalizadas.
+7. La app valida la base NSE personalizada antes de usarla.
+8. Si la base NSE personalizada falla, la app usa la default como fallback.
+9. El diagnóstico indica si se usó NSE default o personalizada.
+10. El cruce NSE no elimina registros sin match; los marca como NSE_no_asignado.
+11. Los exportables incluyen la fuente NSE usada.
+12. La elasticidad puede calcularse por mes, trimestre, semestre, año y global SKU.
+13. La elasticidad trimestral actual se conserva.
+14. Se separa claramente Pricing Histórico de Pricing Futuro.
+15. Pricing Histórico permite simular escenarios pasados.
+16. Pricing Histórico incluye 2x1, 3x2 y segundo al 50%.
+17. Pricing Futuro permite elegir horizonte de 1 mes o 3 meses.
+18. Pricing Futuro permite elegir método de proyección.
+19. El método default es Automático recomendado.
+20. La demanda base futura se calcula antes de aplicar elasticidad.
+21. Los escenarios futuros calculan unidades, ingreso y margen simulados.
+22. Pricing Futuro incluye 2x1, 3x2 y segundo al 50%.
+23. La recomendación final no depende únicamente del Random Forest.
+24. El Random Forest, si se conserva, funciona como apoyo para riesgo/confianza o probabilidad de éxito.
+25. Cada recomendación tiene explicación textual.
+26. Existen categoria_recomendacion y estrategia_especifica.
+27. Los filtros dependientes funcionan en orden categoría → departamento → periodo/horizonte → SKU.
+28. Los exportables descargan archivos válidos.
+29. La app no recalcula procesos pesados innecesariamente.
+30. No hay errores por columnas faltantes tipo "SKU".
+31. La app maneja NaN, infinitos y datos insuficientes sin romperse.
+32. El código queda organizado y comentado.
+33. La app corre localmente.
+34. La app sigue funcionando en el entorno de despliegue actual.
 
 ============================================================
 FORMA DE TRABAJO
@@ -1192,7 +1483,8 @@ Antes de modificar código:
 2. Resume qué archivos modificarás.
 3. Identifica la tecnología usada.
 4. Identifica los nombres reales de columnas.
-5. Propón un plan de cambios por fases.
+5. Identifica cómo se cargan actualmente las bases NSE.
+6. Propón un plan de cambios por fases.
 
 Después:
 
@@ -1209,6 +1501,7 @@ Prioridad de implementación:
 
 Fase 0: auditar repositorio.
 Fase 1: estabilizar carga, limpieza, cruce NSE y diagnóstico.
+Fase 1.1: agregar NSE default y NSE personalizada.
 Fase 2: refactorizar elasticidad multi-periodo.
 Fase 3: separar pricing histórico.
 Fase 4: agregar demanda base futura.
