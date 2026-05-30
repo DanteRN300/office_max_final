@@ -25,15 +25,25 @@ MAX_ROWS_PREVIEW = 30
 # Esto acelera mucho CSV/Excel grandes sin sacrificar el modelo, porque conserva
 # las variables usadas en limpieza, NSE, elasticidad, pricing, filtros y descargas.
 COLUMNAS_LECTURA_VENTAS = [
-    "tran_date", "qty", "net_sale", "prod_nbr", "SKU", "costo2",
-    "precio_base", "ingreso_base", "margen_unitario", "margen_total",
-    "store_nm", "dept_nm", "subdept_nm", "marca", "tipo_marca",
-    "categoria_est_socio", "estado", "key", "id_municipio", "ubica_geo",
+    "tran_date", "fecha", "date", "fecha_transaccion", "fecha_venta",
+    "qty", "unidades", "cantidad", "quantity", "units",
+    "net_sale", "ingreso", "venta", "venta_neta", "net_sales", "sales", "importe",
+    "prod_nbr", "SKU", "sku", "producto", "product_id", "item_id", "prod_id",
+    "costo2", "costo", "cost", "costo_unitario", "unit_cost",
+    "precio_base", "precio", "price", "precio_unitario", "unit_price",
+    "ingreso_base", "margen_unitario", "margen_total",
+    "store_nm", "tienda", "store", "sucursal", "nombre_tienda",
+    "dept_nm", "departamento", "department", "depto",
+    "subdept_nm", "categoria", "categoría", "category", "subcategoria", "sub_category",
+    "marca", "tipo_marca",
+    "categoria_est_socio", "nivel_socioeconomico", "nivel socioeconómico", "nse", "categoria_nse",
+    "estado", "municipio", "key", "id_municipio", "ubica_geo",
 ]
 
 COLUMNAS_LECTURA_NSE = [
     "key", "ubica_geo", "id_municipio", "estado", "municipio",
-    "est_socio", "categoria_est_socio",
+    "est_socio", "categoria_est_socio", "nivel_socioeconomico",
+    "nivel socioeconómico", "nse", "categoria_nse",
 ]
 
 COLUMNAS_LECTURA_PROMOCIONES = [
