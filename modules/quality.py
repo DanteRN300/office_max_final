@@ -58,9 +58,11 @@ def build_quality_diagnostics(
     summary: dict,
     semaforo_datos: pd.DataFrame,
     calidad_varianza: pd.DataFrame,
+    nse_info: dict | None = None,
 ) -> pd.DataFrame:
     """Consolida la tabla interna diagnostico_calidad con métricas claras de Fase 1."""
     ventas = ventas_limpias.copy()
+    nse_info = nse_info or {}
     row = semaforo_datos.iloc[0].to_dict() if semaforo_datos is not None and not semaforo_datos.empty else {}
     sku_var = _sku_variance_table(ventas)
     suficientes = int(sku_var["datos_suficientes"].sum()) if not sku_var.empty else 0
@@ -86,6 +88,11 @@ def build_quality_diagnostics(
         ("SKUs_con_datos_insuficientes", insuficientes, "No cumplen mínimos para análisis robusto"),
         ("semaforo_general_calidad", row.get("Semaforo", "🔴 Rojo"), row.get("Interpretacion", "Sin diagnóstico")),
         ("motivos_semaforo", row.get("Motivos", ""), "Alertas principales"),
+        ("fuente_nse_usada", nse_info.get("fuente_nse_usada", "default"), "Fuente NSE usada para el cruce"),
+        ("estado_validacion_nse", nse_info.get("estado_validacion_nse", "default_precargada"), "Estado de validación de la configuración NSE"),
+        ("porcentaje_match_nse", nse_info.get("porcentaje_match_nse", nse_info.get("porcentaje_asignado", 0.0)), "% de registros con NSE asignado"),
+        ("registros_sin_match_nse", nse_info.get("registros_sin_match_nse", nse_info.get("registros_sin_nse", 0)), "Registros que quedaron como NSE_no_asignado"),
+        ("advertencias_nse", "; ".join(nse_info.get("advertencias_nse", [])), "Advertencias de validación o cruce NSE"),
     ]
 
     for col, nulos in summary.get("nulos_por_columna_final", {}).items():

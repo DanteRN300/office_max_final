@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+from pathlib import Path
 import unicodedata
 from typing import Iterable, Optional, Sequence
 
@@ -12,7 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from .config import STATE_COORDINATES
+from .config import DEFAULT_NSE_DIR, DEFAULT_NSE_FILENAME, NSE_CATEGORIAS_VALIDAS, STATE_COORDINATES
 
 
 def normalize_text(value) -> str:
@@ -579,12 +580,8 @@ def _limpiar_id_municipio(valor):
     return txt
 
 
-@st.cache_data(show_spinner=False)
-def build_default_nse() -> pd.DataFrame:
-    """
-    Crea una base NSE predeterminada mínima y editable.
-    El usuario puede reemplazarla por una base INEGI completa.
-    """
+def _default_nse_hardcoded() -> pd.DataFrame:
+    """Base NSE default embebida como respaldo si falta el CSV versionado."""
     rows = [
         ("Aguascalientes-Aguascalientes", 1001, "Aguascalientes", "Aguascalientes", 3),
         ("Mexicali-Baja California", 2002, "Baja California", "Mexicali", 3),
@@ -624,17 +621,154 @@ def build_default_nse() -> pd.DataFrame:
     return df
 
 
-def merge_sales_with_nse(sales_df: pd.DataFrame, nse_df: Optional[pd.DataFrame]) -> tuple[pd.DataFrame, dict]:
+@st.cache_data(show_spinner=False)
+def build_default_nse() -> pd.DataFrame:
+    """
+    Carga la base NSE default precargada desde data/default_nse.
+
+    Si el CSV versionado no existe o no se puede leer, conserva un respaldo
+    embebido para que la app siga funcionando aunque el usuario solo suba ventas.
+    """
+    default_path = Path(DEFAULT_NSE_DIR) / DEFAULT_NSE_FILENAME
+    try:
+        if default_path.exists():
+            df = pd.read_csv(default_path)
+            return clean_text_columns(normalize_column_names(df))
+    except Exception:
+        pass
+    return _default_nse_hardcoded()
+
+
+def get_default_nse_path() -> str:
+    """Ruta relativa de la base NSE default usada por la app."""
+    return str(Path(DEFAULT_NSE_DIR) / DEFAULT_NSE_FILENAME)
+
+
+def _nse_value_column(df: pd.DataFrame) -> str | None:
+    for col in ["categoria_est_socio", "est_socio", "nivel_socioeconomico", "nse", "categoria_nse"]:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _nse_join_columns(nse: pd.DataFrame, sales: pd.DataFrame) -> list[str]:
+    joins: list[str] = []
+    if "key" in nse.columns and "key" in sales.columns:
+        joins.append("key")
+    nse_has_municipio = "id_municipio" in nse.columns or "ubica_geo" in nse.columns
+    if nse_has_municipio and "id_municipio" in sales.columns:
+        joins.append("id_municipio")
+    return joins
+
+
+def validate_custom_nse(nse_df: pd.DataFrame | None, sales_df: pd.DataFrame | None) -> tuple[bool, list[str], dict]:
+    """Valida una base NSE personalizada antes de permitir su uso en el cruce."""
+    warnings: list[str] = []
+    info: dict = {
+        "estado_validacion_nse": "pendiente",
+        "join_columns": [],
+        "advertencias_nse": warnings,
+    }
+
+    if nse_df is None or nse_df.empty:
+        warnings.append("La base NSE personalizada está vacía.")
+        info["estado_validacion_nse"] = "fallida_base_vacia"
+        return False, warnings, info
+
+    nse = clean_text_columns(normalize_column_names(nse_df))
+    sales = clean_text_columns(normalize_column_names(sales_df)) if sales_df is not None else pd.DataFrame()
+    nse.columns = nse.columns.astype(str).str.strip()
+    sales.columns = sales.columns.astype(str).str.strip()
+
+    value_col = _nse_value_column(nse)
+    if value_col is None:
+        warnings.append("La base NSE debe contener una columna NSE: categoria_est_socio, est_socio, nivel_socioeconomico, nse o categoria_nse.")
+        info["estado_validacion_nse"] = "fallida_columnas_nse"
+        return False, warnings, info
+
+    if "ubica_geo" in nse.columns and "id_municipio" not in nse.columns:
+        nse["id_municipio"] = nse["ubica_geo"]
+    if "ubica_geo" in sales.columns and "id_municipio" not in sales.columns:
+        sales["id_municipio"] = sales["ubica_geo"]
+
+    join_cols = _nse_join_columns(nse, sales)
+    info["join_columns"] = join_cols
+    if not join_cols:
+        warnings.append("No hay claves de cruce compatibles entre ventas y NSE personalizada. Usa key o id_municipio/ubica_geo en ambas bases.")
+        info["estado_validacion_nse"] = "fallida_claves_incompatibles"
+        return False, warnings, info
+
+    normalized_nse = nse[value_col].apply(normalizar_categoria_est_socio)
+    invalid_mask = normalized_nse.isna() & nse[value_col].notna()
+    if invalid_mask.any():
+        warnings.append(
+            "La base NSE contiene valores NSE no válidos. Valores aceptados: "
+            + ", ".join(NSE_CATEGORIAS_VALIDAS)
+            + " o códigos 1-4."
+        )
+        info["estado_validacion_nse"] = "fallida_valores_nse_invalidos"
+        return False, warnings, info
+
+    if normalized_nse.isna().any():
+        warnings.append("La base NSE contiene valores nulos en la columna NSE usada para asignación.")
+        info["estado_validacion_nse"] = "fallida_nulos_nse"
+        return False, warnings, info
+
+    for join_col in join_cols:
+        if join_col not in nse.columns:
+            continue
+        key_series = nse[join_col].apply(_limpiar_id_municipio) if join_col == "id_municipio" else nse[join_col].astype("string").str.strip().str.lower()
+        if key_series.isna().any() or key_series.eq("").any():
+            warnings.append(f"La base NSE contiene valores nulos o vacíos en la clave de cruce `{join_col}`.")
+            info["estado_validacion_nse"] = "fallida_nulos_clave"
+            return False, warnings, info
+
+        check = pd.DataFrame({join_col: key_series, "categoria_est_socio": normalized_nse})
+        conflictivos = check.groupby(join_col)["categoria_est_socio"].nunique(dropna=True)
+        conflictivos = conflictivos[conflictivos > 1]
+        if not conflictivos.empty:
+            warnings.append(f"La clave `{join_col}` tiene duplicados con NSE distintos; corrige {len(conflictivos)} clave(s) conflictiva(s).")
+            info["estado_validacion_nse"] = "fallida_duplicados_conflictivos"
+            return False, warnings, info
+
+        duplicados = int(key_series.duplicated().sum())
+        if duplicados > 0:
+            warnings.append(f"La clave `{join_col}` contiene {duplicados:,} duplicados no conflictivos; se usará una fila por clave.")
+
+        sales_key = sales[join_col].apply(_limpiar_id_municipio) if join_col == "id_municipio" else sales[join_col].astype("string").str.strip().str.lower()
+        overlap = set(sales_key.dropna().astype(str)) & set(key_series.dropna().astype(str))
+        if len(overlap) == 0:
+            warnings.append(f"La clave `{join_col}` no comparte valores entre ventas y NSE personalizada.")
+            info["estado_validacion_nse"] = "fallida_sin_compatibilidad_ventas"
+            return False, warnings, info
+
+    info["estado_validacion_nse"] = "valida"
+    return True, warnings, info
+
+
+def merge_sales_with_nse(
+    sales_df: pd.DataFrame,
+    nse_df: Optional[pd.DataFrame],
+    fuente_nse: str = "default",
+    estado_validacion_nse: str = "default_precargada",
+    advertencias_nse: Optional[list[str]] = None,
+) -> tuple[pd.DataFrame, dict]:
     """
     Cruza ventas con NSE de forma flexible.
     Prioriza categoria_est_socio y usa est_socio solo para construirla.
     """
     ventas = clean_text_columns(normalize_column_names(sales_df))
+    advertencias_nse = advertencias_nse or []
     info = {
         "nse_usado": False,
+        "fuente_nse_usada": fuente_nse,
+        "estado_validacion_nse": estado_validacion_nse,
         "registros_con_nse": 0,
         "registros_sin_nse": len(ventas),
         "porcentaje_asignado": 0.0,
+        "porcentaje_match_nse": 0.0,
+        "registros_sin_match_nse": len(ventas),
+        "advertencias_nse": advertencias_nse,
         "mensaje": "No se aplicó cruce NSE.",
     }
 
@@ -644,6 +778,10 @@ def merge_sales_with_nse(sales_df: pd.DataFrame, nse_df: Optional[pd.DataFrame])
     if nse_df is None or nse_df.empty:
         if "categoria_est_socio" not in ventas.columns:
             ventas["categoria_est_socio"] = np.nan
+        ventas["fuente_nse"] = fuente_nse
+        ventas["nse_asignado"] = ventas["categoria_est_socio"].fillna("NSE_no_asignado")
+        ventas["categoria_est_socio"] = ventas["nse_asignado"]
+        ventas["nse_match_status"] = "sin_match"
         ventas = add_business_alias_columns(ventas)
         return ventas, info
 
@@ -660,9 +798,16 @@ def merge_sales_with_nse(sales_df: pd.DataFrame, nse_df: Optional[pd.DataFrame])
         if "categoria_est_socio" not in ventas.columns:
             ventas["categoria_est_socio"] = np.nan
         info["mensaje"] = "La base NSE no contiene categoria_est_socio ni est_socio."
+        ventas["fuente_nse"] = fuente_nse
+        ventas["nse_asignado"] = ventas["categoria_est_socio"].fillna("NSE_no_asignado")
+        ventas["categoria_est_socio"] = ventas["nse_asignado"]
+        ventas["nse_match_status"] = "sin_match"
+        ventas = add_business_alias_columns(ventas)
         return ventas, info
 
     # Si la base NSE es granular por hogares, calcular moda por municipio.
+    if "ubica_geo" in ventas.columns and "id_municipio" not in ventas.columns:
+        ventas["id_municipio"] = ventas["ubica_geo"].apply(_limpiar_id_municipio)
     if "ubica_geo" in nse.columns:
         nse["id_municipio"] = nse["ubica_geo"].apply(_limpiar_id_municipio)
 
@@ -757,6 +902,17 @@ def merge_sales_with_nse(sales_df: pd.DataFrame, nse_df: Optional[pd.DataFrame])
     ventas["categoria_est_socio"] = ventas["categoria_est_socio"].apply(normalizar_categoria_est_socio)
     asignados = int(ventas["categoria_est_socio"].notna().sum())
     total = len(ventas)
+    match_status_asignado = (
+        "match_personalizado"
+        if fuente_nse == "personalizada"
+        else "fallback_default"
+        if estado_validacion_nse == "usada_default_por_fallback"
+        else "match_default"
+    )
+    ventas["fuente_nse"] = fuente_nse
+    ventas["nse_asignado"] = ventas["categoria_est_socio"].fillna("NSE_no_asignado")
+    ventas["nse_match_status"] = np.where(ventas["categoria_est_socio"].notna(), match_status_asignado, "sin_match")
+    ventas["categoria_est_socio"] = ventas["nse_asignado"]
 
     info.update(
         {
@@ -764,7 +920,9 @@ def merge_sales_with_nse(sales_df: pd.DataFrame, nse_df: Optional[pd.DataFrame])
             "registros_con_nse": asignados,
             "registros_sin_nse": int(total - asignados),
             "porcentaje_asignado": float((asignados / total * 100) if total else 0),
-            "mensaje": f"NSE asignado a {asignados:,} de {total:,} registros.",
+            "porcentaje_match_nse": float((asignados / total * 100) if total else 0),
+            "registros_sin_match_nse": int(total - asignados),
+            "mensaje": f"NSE asignado a {asignados:,} de {total:,} registros usando fuente {fuente_nse}.",
         }
     )
     ventas = add_business_alias_columns(ventas)
