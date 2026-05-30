@@ -35,6 +35,7 @@ from modules.utils import (
     get_uploaded_file_info,
     get_uploaded_file_signature,
     merge_sales_with_nse,
+    normalize_column_names,
     read_uploaded_file,
     render_kpi_card,
     validate_columns,
@@ -96,19 +97,26 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 def process_quality_cached(
     sales_df: pd.DataFrame,
     nse_df: pd.DataFrame | None,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict, pd.DataFrame, pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """
     Limpia ventas, cruza NSE y calcula semáforo de calidad.
 
     Esta función NO calcula elasticidad ni pricing. Así la app responde rápido
     después de cargar ventas y solo calcula la vista activa.
     """
-    from modules.quality import calculate_quality_diagnosis
+    from modules.quality import build_quality_diagnostics, calculate_quality_diagnosis
 
     ventas_limpias, resumen_limpieza, summary = clean_sales_data(sales_df)
     ventas_nse, nse_info = merge_sales_with_nse(ventas_limpias, nse_df)
     semaforo, calidad_varianza = calculate_quality_diagnosis(ventas_nse, resumen_limpieza, summary)
-    return ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, nse_info
+    diagnostico_calidad = build_quality_diagnostics(
+        ventas_nse,
+        resumen_limpieza,
+        summary,
+        semaforo,
+        calidad_varianza,
+    )
+    return ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, diagnostico_calidad, nse_info
 
 
 def calculate_elasticity_cached(
@@ -324,6 +332,7 @@ def init_state() -> None:
         "semaforo": pd.DataFrame(),
         "calidad_varianza": pd.DataFrame(),
         "resumen_limpieza": pd.DataFrame(),
+        "diagnostico_calidad": pd.DataFrame(),
         "nse_info": {},
         "sales_signature": None,
         "promo_signature": None,
@@ -490,6 +499,7 @@ def process_quality_pipeline(
         st.sidebar.error("La base de ventas está vacía o no se pudo leer.")
         return
 
+    sales_df = normalize_column_names(sales_df)
     missing = validate_columns(sales_df, COLUMNAS_MINIMAS_VENTAS)
     if missing:
         st.sidebar.error("Faltan columnas obligatorias: " + ", ".join(missing))
@@ -501,15 +511,15 @@ def process_quality_pipeline(
         cache = st.session_state.manual_cache.setdefault("quality", {})
 
         if cache_key in cache:
-            ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, nse_info = cache[cache_key]
+            ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, diagnostico_calidad, nse_info = cache[cache_key]
         else:
             with st.spinner("Limpiando ventas, cruzando NSE y calculando calidad..."):
-                ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, nse_info = process_quality_cached(
+                ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, diagnostico_calidad, nse_info = process_quality_cached(
                     sales_df,
                     nse_df,
                 )
             cache.clear()
-            cache[cache_key] = (ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, nse_info)
+            cache[cache_key] = (ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, diagnostico_calidad, nse_info)
 
         st.session_state.quality_cache_key = cache_key
 
@@ -525,6 +535,7 @@ def process_quality_pipeline(
         st.session_state.resumen_limpieza = resumen_limpieza
         st.session_state.semaforo = semaforo
         st.session_state.calidad_varianza = calidad_varianza
+        st.session_state.diagnostico_calidad = diagnostico_calidad
         st.session_state.nse_info = nse_info
         st.session_state.processed = True
         reset_model_results()
@@ -738,6 +749,7 @@ def render_quality_view() -> None:
     resumen_limpieza = st.session_state.resumen_limpieza
     calidad_varianza = st.session_state.calidad_varianza
     nse_info = st.session_state.nse_info
+    diagnostico_calidad = st.session_state.diagnostico_calidad
 
     if not semaforo.empty:
         row = semaforo.iloc[0]
@@ -793,7 +805,10 @@ def render_quality_view() -> None:
     with st.expander("Métricas de varianza"):
         st.dataframe(calidad_varianza, use_container_width=True)
 
-    st.subheader("Vista previa de la base limpia y cruzada")
+    with st.expander("Diagnóstico de calidad consolidado"):
+        st.dataframe(diagnostico_calidad, use_container_width=True)
+
+    st.subheader("Vista previa de ventas_limpias")
     st.dataframe(ventas.head(MAX_ROWS_PREVIEW), use_container_width=True)
     st.success("La base está lista. Pasa a Elasticidad o Pricing cuando quieras calcular esas vistas.")
 

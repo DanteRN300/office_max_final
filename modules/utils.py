@@ -26,6 +26,128 @@ def normalize_text(value) -> str:
     return txt
 
 
+
+
+# Alias de columnas frecuentes para estabilizar la carga inicial sin exigir un
+# layout único al usuario. Los nombres canónicos conservan compatibilidad con
+# elasticidad/pricing, pero la Fase 1 también crea aliases de negocio legibles.
+COLUMN_ALIASES = {
+    "tran_date": ["tran_date", "fecha", "date", "transaction_date", "fecha_transaccion", "fecha_venta"],
+    "qty": ["qty", "unidades", "cantidad", "quantity", "unit_sales", "units"],
+    "net_sale": ["net_sale", "ingreso", "venta", "venta_neta", "net_sales", "sales", "importe"],
+    "prod_nbr": ["prod_nbr", "sku", "SKU", "producto", "product_id", "item_id", "prod_id"],
+    "costo2": ["costo2", "costo", "cost", "costo_unitario", "unit_cost"],
+    "precio_base": ["precio_base", "precio", "price", "precio_unitario", "unit_price"],
+    "store_nm": ["store_nm", "tienda", "store", "sucursal", "nombre_tienda"],
+    "dept_nm": ["dept_nm", "departamento", "department", "depto"],
+    "subdept_nm": ["subdept_nm", "categoria", "categoría", "category", "subcategoria", "sub_category"],
+    "estado": ["estado", "state", "entidad"],
+    "municipio": ["municipio", "city", "ciudad", "localidad"],
+    "categoria_est_socio": ["categoria_est_socio", "nivel_socioeconomico", "nivel socioeconómico", "nse", "categoria_nse"],
+}
+
+
+def _canonical_column_token(value: str) -> str:
+    """Convierte nombres de columnas a tokens comparables sin perder canónicos."""
+    txt = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("utf-8")
+    txt = txt.strip().lower()
+    txt = re.sub(r"[^0-9a-zA-Z]+", "_", txt)
+    return re.sub(r"_+", "_", txt).strip("_")
+
+
+def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza encabezados y renombra aliases conocidos a columnas canónicas."""
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    normalized_originals = {}
+    renamed = []
+    for col in out.columns:
+        base = re.sub(r"\s+", " ", str(col)).strip()
+        if base not in normalized_originals:
+            normalized_originals[base] = col
+        renamed.append(base)
+    out.columns = renamed
+
+    token_to_col = {_canonical_column_token(c): c for c in out.columns}
+    rename_map = {}
+    for canonical, aliases in COLUMN_ALIASES.items():
+        if canonical in out.columns:
+            continue
+        for alias in aliases:
+            found = token_to_col.get(_canonical_column_token(alias))
+            if found is not None and found not in rename_map:
+                rename_map[found] = canonical
+                break
+
+    if rename_map:
+        out = out.rename(columns=rename_map)
+    return out
+
+
+def clean_text_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Quita espacios dobles y espacios finales/iniciales de todas las columnas de texto."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    text_cols = out.select_dtypes(include=["object", "string"]).columns.tolist()
+    priority_cols = [c for c in ["store_nm", "tienda"] if c in out.columns]
+    for col in dict.fromkeys(priority_cols + text_cols):
+        out[col] = out[col].where(
+            out[col].isna(),
+            out[col].astype("string").str.replace(r"\s+", " ", regex=True).str.strip(),
+        )
+    return out
+
+
+def add_business_alias_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Conserva columnas clave canónicas y agrega aliases de negocio para diagnóstico."""
+    out = df.copy()
+    alias_sources = {
+        "SKU": "prod_nbr",
+        "fecha": "tran_date",
+        "precio": "precio_unitario",
+        "unidades": "qty",
+        "ingreso": "net_sale",
+        "costo": "costo_unitario",
+        "margen": "margen_total",
+        "categoría": "subdept_nm",
+        "departamento": "dept_nm",
+        "tienda": "store_nm",
+        "nivel socioeconómico": "categoria_est_socio",
+    }
+    for alias, source in alias_sources.items():
+        if alias not in out.columns and source in out.columns:
+            out[alias] = out[source]
+    return out
+
+
+def add_period_variables(df: pd.DataFrame, date_col: str = "tran_date") -> pd.DataFrame:
+    """Crea mes/año/trimestre/semestre y periodos en varios niveles."""
+    out = df.copy()
+    if date_col not in out.columns:
+        return out
+    fechas = parse_transaction_dates(out[date_col])
+    out[date_col] = fechas
+    out["mes"] = fechas.dt.month.astype("Int64")
+    out["año"] = fechas.dt.year.astype("Int64")
+    out["trimestre"] = fechas.dt.quarter.astype("Int64")
+    out["semestre"] = np.where(fechas.dt.month.le(6), 1, 2)
+    out["semestre"] = pd.Series(out["semestre"], index=out.index).where(fechas.notna()).astype("Int64")
+    mensual = fechas.dt.to_period("M")
+    trimestral = fechas.dt.to_period("Q")
+    anual = fechas.dt.to_period("Y")
+    out["periodo_mensual"] = mensual.astype("string")
+    out["periodo_trimestral"] = trimestral.astype("string")
+    out["periodo_semestral"] = np.where(
+        fechas.notna(),
+        fechas.dt.year.astype("Int64").astype("string") + "-S" + out["semestre"].astype("string"),
+        pd.NA,
+    )
+    out["periodo_anual"] = anual.astype("string")
+    return out
+
 def _normalizar_lista_columnas(usecols: Optional[Sequence[str]]) -> tuple[str, ...] | None:
     """Normaliza usecols para poder cachear lecturas con columnas seleccionadas."""
     if not usecols:
@@ -38,7 +160,8 @@ def _usecols_callable(columnas_permitidas: tuple[str, ...] | None):
     if not columnas_permitidas:
         return None
     permitidas = {str(c).strip() for c in columnas_permitidas}
-    return lambda col: str(col).strip() in permitidas
+    permitidas_tokens = {_canonical_column_token(c) for c in permitidas}
+    return lambda col: str(col).strip() in permitidas or _canonical_column_token(col) in permitidas_tokens
 
 
 def _dtype_map_for_columns(columnas: tuple[str, ...] | None) -> dict:
@@ -49,6 +172,8 @@ def _dtype_map_for_columns(columnas: tuple[str, ...] | None) -> dict:
         "prod_nbr", "SKU", "store_nm", "dept_nm", "subdept_nm", "marca", "tipo_marca",
         "categoria_est_socio", "estado", "key", "id_municipio", "ubica_geo", "municipio",
         "est_socio", "sku", "promo_id", "id_promocion", "mecanica",
+        "tienda", "departamento", "categoria", "categoría", "municipio",
+        "nivel_socioeconomico", "nivel socioeconómico",
     }
     return {c: "string" for c in columnas if c in text_cols}
 
@@ -97,8 +222,11 @@ def _select_existing_usecols(file_bytes: bytes, encoding: str, usecols_tuple: tu
     if not available:
         return list(usecols_tuple)
     requested = {str(c).strip() for c in usecols_tuple}
-    selected = [c for c in available if c in requested]
-    return selected if selected else list(usecols_tuple)
+    requested_tokens = {_canonical_column_token(c) for c in requested}
+    selected = [c for c in available if c in requested or _canonical_column_token(c) in requested_tokens]
+    # Si no hay coincidencias exactas/flexibles, no forzamos usecols para evitar
+    # errores de pandas y permitir que la normalización posterior diagnostique.
+    return selected if selected else None
 
 
 
@@ -123,7 +251,15 @@ def _read_uploaded_file_cached(
     dtype_map = _dtype_map_for_columns(usecols_tuple)
 
     if name.endswith(".parquet"):
-        return pd.read_parquet(io.BytesIO(file_bytes), columns=list(usecols_tuple) if usecols_tuple else None)
+        if not usecols_tuple:
+            return pd.read_parquet(io.BytesIO(file_bytes))
+        try:
+            return pd.read_parquet(io.BytesIO(file_bytes), columns=list(usecols_tuple))
+        except Exception:
+            df = pd.read_parquet(io.BytesIO(file_bytes))
+            selector = _usecols_callable(usecols_tuple)
+            selected = [col for col in df.columns if selector(col)] if selector else df.columns.tolist()
+            return df[selected] if selected else df
 
     if name.endswith(".csv"):
         # Ruta rápida: intenta engine=pyarrow con columnas existentes.
@@ -218,14 +354,8 @@ def validate_columns(df: pd.DataFrame, required_columns: Sequence[str]) -> list[
 
 
 def clean_store_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Limpia espacios dobles, iniciales y finales de store_nm."""
-    df = df.copy()
-    if "store_nm" in df.columns:
-        df["store_nm"] = df["store_nm"].where(
-            df["store_nm"].isna(),
-            df["store_nm"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip(),
-        )
-    return df
+    """Limpia espacios dobles, iniciales y finales de store_nm y textos equivalentes."""
+    return clean_text_columns(df)
 
 
 def parse_transaction_dates(series: pd.Series) -> pd.Series:
@@ -298,8 +428,8 @@ def clean_sales_data(
     if sales_df is None or sales_df.empty:
         raise ValueError("La base de ventas está vacía.")
 
-    ventas = sales_df.copy()
-    ventas.columns = ventas.columns.astype(str).str.strip()
+    ventas = normalize_column_names(sales_df)
+    ventas = clean_text_columns(ventas)
     filas_originales = len(ventas)
     resumen = []
 
@@ -322,18 +452,20 @@ def clean_sales_data(
 
     ventas["tran_date"] = parse_transaction_dates(ventas["tran_date"])
 
-    for col in ["qty", "net_sale", "prod_nbr", "costo2"]:
+    for col in ["qty", "net_sale", "costo2"]:
         ventas[col] = _safe_numeric(ventas[col])
+    ventas["prod_nbr"] = ventas["prod_nbr"].astype("string").str.strip()
 
     antes = len(ventas)
     ventas = ventas.dropna(subset=["tran_date", "qty", "net_sale", "prod_nbr", "costo2"]).copy()
+    ventas = ventas[ventas["prod_nbr"].astype("string").str.len() > 0].copy()
     registrar("Eliminar nulos en columnas críticas", antes, len(ventas))
 
     antes = len(ventas)
     ventas = ventas[(ventas["qty"] > 0) & (ventas["net_sale"] > 0)].copy()
     registrar("Eliminar qty <= 0 y net_sale <= 0", antes, len(ventas))
 
-    ventas["prod_nbr"] = ventas["prod_nbr"].astype("Int64").astype(str)
+    ventas["prod_nbr"] = ventas["prod_nbr"].astype("string").str.strip().astype(str)
     ventas["precio_unitario"] = ventas["net_sale"] / ventas["qty"]
 
     antes = len(ventas)
@@ -386,7 +518,8 @@ def clean_sales_data(
     ) if "margen_total" in ventas.columns else ventas["margen_unitario"] * ventas["qty"]
     ventas["margen_total"] = ventas["margen_total"].fillna(ventas["margen_unitario"] * ventas["qty"])
 
-    ventas["periodo_mensual"] = ventas["tran_date"].dt.to_period("M").astype(str)
+    ventas = add_period_variables(ventas, "tran_date")
+    ventas = add_business_alias_columns(ventas)
 
     summary = {
         "filas_originales": int(filas_originales),
@@ -394,6 +527,10 @@ def clean_sales_data(
         "registros_removidos": int(filas_originales - len(ventas)),
         "porcentaje_removido": float(((filas_originales - len(ventas)) / filas_originales) if filas_originales else 1),
         "duplicados_originales": int(sales_df.duplicated().sum()),
+        "duplicados_eliminados": int(resumen[0]["Registros_Removidos"] if resumen else 0),
+        "nulos_por_columna_original": sales_df.isna().sum().astype(int).to_dict(),
+        "nulos_por_columna_final": ventas.isna().sum().astype(int).to_dict(),
+        "columnas_finales": ventas.columns.astype(str).tolist(),
         "faltantes_pct_original": float(sales_df.isna().mean().mean() * 100),
         "infinitos_detectados_original": int(
             np.isinf(sales_df.select_dtypes(include=[np.number]).to_numpy()).sum()
@@ -492,7 +629,7 @@ def merge_sales_with_nse(sales_df: pd.DataFrame, nse_df: Optional[pd.DataFrame])
     Cruza ventas con NSE de forma flexible.
     Prioriza categoria_est_socio y usa est_socio solo para construirla.
     """
-    ventas = sales_df.copy()
+    ventas = clean_text_columns(normalize_column_names(sales_df))
     info = {
         "nse_usado": False,
         "registros_con_nse": 0,
@@ -507,9 +644,10 @@ def merge_sales_with_nse(sales_df: pd.DataFrame, nse_df: Optional[pd.DataFrame])
     if nse_df is None or nse_df.empty:
         if "categoria_est_socio" not in ventas.columns:
             ventas["categoria_est_socio"] = np.nan
+        ventas = add_business_alias_columns(ventas)
         return ventas, info
 
-    nse = nse_df.copy()
+    nse = clean_text_columns(normalize_column_names(nse_df))
     ventas.columns = ventas.columns.astype(str).str.strip()
     nse.columns = nse.columns.astype(str).str.strip()
 
@@ -629,6 +767,7 @@ def merge_sales_with_nse(sales_df: pd.DataFrame, nse_df: Optional[pd.DataFrame])
             "mensaje": f"NSE asignado a {asignados:,} de {total:,} registros.",
         }
     )
+    ventas = add_business_alias_columns(ventas)
     return ventas, info
 
 
