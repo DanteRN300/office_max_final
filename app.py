@@ -32,6 +32,7 @@ from modules.utils import (
     filter_dataframe_dependently,
     format_money,
     format_num,
+    get_default_nse_path,
     get_uploaded_file_info,
     get_uploaded_file_signature,
     merge_sales_with_nse,
@@ -39,6 +40,7 @@ from modules.utils import (
     read_uploaded_file,
     render_kpi_card,
     validate_columns,
+    validate_custom_nse,
 )
 
 
@@ -97,6 +99,9 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 def process_quality_cached(
     sales_df: pd.DataFrame,
     nse_df: pd.DataFrame | None,
+    fuente_nse: str = "default",
+    estado_validacion_nse: str = "default_precargada",
+    advertencias_nse: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """
     Limpia ventas, cruza NSE y calcula semáforo de calidad.
@@ -107,7 +112,13 @@ def process_quality_cached(
     from modules.quality import build_quality_diagnostics, calculate_quality_diagnosis
 
     ventas_limpias, resumen_limpieza, summary = clean_sales_data(sales_df)
-    ventas_nse, nse_info = merge_sales_with_nse(ventas_limpias, nse_df)
+    ventas_nse, nse_info = merge_sales_with_nse(
+        ventas_limpias,
+        nse_df,
+        fuente_nse=fuente_nse,
+        estado_validacion_nse=estado_validacion_nse,
+        advertencias_nse=advertencias_nse,
+    )
     semaforo, calidad_varianza = calculate_quality_diagnosis(ventas_nse, resumen_limpieza, summary)
     diagnostico_calidad = build_quality_diagnostics(
         ventas_nse,
@@ -115,6 +126,7 @@ def process_quality_cached(
         summary,
         semaforo,
         calidad_varianza,
+        nse_info,
     )
     return ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, diagnostico_calidad, nse_info
 
@@ -315,7 +327,10 @@ def init_state() -> None:
     """Inicializa session_state."""
     defaults = {
         "active_nse_df": build_default_nse(),
-        "nse_source": "Base NSE predeterminada",
+        "nse_mode": "Usar base NSE default",
+        "nse_source": "Base NSE default",
+        "nse_validation_status": "default_precargada",
+        "nse_warnings": [],
         "processed": False,
         "elasticity_ready": False,
         "pricing_ready": False,
@@ -398,52 +413,45 @@ def render_sidebar() -> str:
             key="promo_file",
         )
 
-    with st.sidebar.expander("C. Base NSE", expanded=False):
+    with st.sidebar.expander("C. Configuración de nivel socioeconómico", expanded=False):
         st.info(
-            "Puedes usar la base NSE predeterminada o subir una modificada. "
-            "El modelo final usa `categoria_est_socio`, no `est_socio_nbr`."
+            "La opción predeterminada usa la base NSE default precargada. "
+            "Si subes una base personalizada, se validará al procesar ventas; si falla, se usará default como fallback."
         )
 
         default_nse = build_default_nse()
+        st.caption(f"Base default: `{get_default_nse_path()}`")
         st.download_button(
-            "Descargar base NSE predeterminada",
+            "Descargar base NSE default",
             data=convert_df_to_csv(default_nse),
-            file_name="base_nse_predeterminada.csv",
+            file_name="base_nse_default.csv",
             mime="text/csv",
         )
 
-        nse_file = st.file_uploader(
-            "Subir base NSE modificada",
-            type=["csv", "xlsx", "xls", "parquet"],
-            key="nse_file",
+        nse_mode = st.radio(
+            "Configuración de nivel socioeconómico",
+            ["Usar base NSE default", "Subir base NSE personalizada"],
+            index=0 if st.session_state.get("nse_mode", "Usar base NSE default") == "Usar base NSE default" else 1,
+            key="nse_mode_selector",
         )
+        st.session_state.nse_mode = nse_mode
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("Aplicar cambios de NSE", use_container_width=True):
-                if nse_file is None:
-                    st.warning("Primero sube una base NSE modificada.")
-                else:
-                    try:
-                        columnas_nse = COLUMNAS_LECTURA_NSE if LEER_SOLO_COLUMNAS_NECESARIAS else None
-                        st.session_state.active_nse_df = read_uploaded_file(nse_file, usecols=columnas_nse)
-                        st.session_state.nse_signature = get_uploaded_file_signature(nse_file)
-                        st.session_state.nse_source = f"Base NSE subida: {nse_file.name}"
-                        st.success("Cambios de NSE aplicados. Vuelve a procesar ventas para reflejarlos.")
-                        reset_model_results()
-                        st.session_state.processed = False
-                    except Exception as exc:
-                        st.error(str(exc))
-        with col_b:
-            if st.button("Continuar con base predeterminada", use_container_width=True):
-                st.session_state.active_nse_df = default_nse
-                st.session_state.nse_signature = "default_nse"
-                st.session_state.nse_source = "Base NSE predeterminada"
-                st.success("Se usará la base predeterminada. Vuelve a procesar ventas para reflejarlo.")
-                reset_model_results()
-                st.session_state.processed = False
+        nse_file = None
+        if nse_mode == "Subir base NSE personalizada":
+            nse_file = st.file_uploader(
+                "Subir base NSE personalizada",
+                type=["csv", "xlsx", "xls", "parquet"],
+                key="nse_file",
+            )
+            st.caption("Se validan columnas NSE, claves de cruce, nulos, duplicados conflictivos, valores válidos y compatibilidad con ventas.")
+        else:
+            st.session_state.active_nse_df = default_nse
+            st.session_state.nse_signature = "default_nse"
+            st.session_state.nse_source = "Base NSE default"
+            st.session_state.nse_validation_status = "default_precargada"
+            st.session_state.nse_warnings = []
 
-        st.caption(f"NSE activo: {st.session_state.nse_source}")
+        st.caption(f"Modo NSE seleccionado: {nse_mode}")
 
     if sales_file is not None:
         st.sidebar.success(f"Ventas listas: {get_uploaded_file_info(sales_file)}")
@@ -465,21 +473,58 @@ def render_sidebar() -> str:
             try:
                 columnas_ventas = COLUMNAS_LECTURA_VENTAS if LEER_SOLO_COLUMNAS_NECESARIAS else None
                 columnas_promos = COLUMNAS_LECTURA_PROMOCIONES if LEER_SOLO_COLUMNAS_NECESARIAS else None
+                columnas_nse = COLUMNAS_LECTURA_NSE if LEER_SOLO_COLUMNAS_NECESARIAS else None
 
                 with st.spinner("Leyendo archivo de ventas y preparando vista de calidad..."):
                     sales_signature = get_uploaded_file_signature(sales_file)
                     promo_signature = get_uploaded_file_signature(promo_file) if promo_file is not None else "sin_promociones"
-                    nse_signature = st.session_state.get("nse_signature", "default_nse")
                     sales_df = read_uploaded_file(sales_file, usecols=columnas_ventas)
                     promo_df = read_uploaded_file(promo_file, usecols=columnas_promos) if promo_file is not None else None
 
+                    nse_df = build_default_nse()
+                    fuente_nse = "default"
+                    estado_validacion_nse = "default_precargada"
+                    advertencias_nse: list[str] = []
+                    nse_signature = "default_nse"
+
+                    if st.session_state.get("nse_mode") == "Subir base NSE personalizada":
+                        if nse_file is None:
+                            advertencias_nse = ["Se seleccionó NSE personalizada, pero no se subió archivo. Se usa NSE default como fallback."]
+                            estado_validacion_nse = "usada_default_por_fallback"
+                            st.sidebar.warning(advertencias_nse[0])
+                        else:
+                            custom_signature = get_uploaded_file_signature(nse_file)
+                            custom_nse_df = read_uploaded_file(nse_file, usecols=columnas_nse)
+                            is_valid, advertencias_nse, validation_info = validate_custom_nse(custom_nse_df, sales_df)
+                            if is_valid:
+                                nse_df = custom_nse_df
+                                fuente_nse = "personalizada"
+                                estado_validacion_nse = validation_info.get("estado_validacion_nse", "valida")
+                                nse_signature = custom_signature
+                                st.sidebar.success("Base NSE personalizada válida. Se usará para el cruce.")
+                            else:
+                                fuente_nse = "default"
+                                estado_validacion_nse = "usada_default_por_fallback"
+                                nse_signature = f"default_fallback_{custom_signature}"
+                                st.sidebar.warning("La NSE personalizada no es válida; se usará la base default como fallback.")
+                                for warning in advertencias_nse[:5]:
+                                    st.sidebar.warning(warning)
+
                 st.session_state.sales_signature = sales_signature
                 st.session_state.promo_signature = promo_signature
+                st.session_state.nse_signature = nse_signature
+                st.session_state.active_nse_df = nse_df
+                st.session_state.nse_source = "Base NSE personalizada" if fuente_nse == "personalizada" else "Base NSE default"
+                st.session_state.nse_validation_status = estado_validacion_nse
+                st.session_state.nse_warnings = advertencias_nse
                 process_quality_pipeline(
                     sales_df,
                     promo_df,
-                    st.session_state.active_nse_df,
-                    cache_key=(sales_signature, nse_signature),
+                    nse_df,
+                    fuente_nse=fuente_nse,
+                    estado_validacion_nse=estado_validacion_nse,
+                    advertencias_nse=advertencias_nse,
+                    cache_key=(sales_signature, nse_signature, estado_validacion_nse),
                 )
             except Exception as exc:
                 st.session_state.processed = False
@@ -492,6 +537,9 @@ def process_quality_pipeline(
     sales_df: pd.DataFrame,
     promo_df: pd.DataFrame | None,
     nse_df: pd.DataFrame | None,
+    fuente_nse: str = "default",
+    estado_validacion_nse: str = "default_precargada",
+    advertencias_nse: list[str] | None = None,
     cache_key: tuple | None = None,
 ) -> None:
     """Ejecuta solo limpieza, cruce NSE y semáforo."""
@@ -517,6 +565,9 @@ def process_quality_pipeline(
                 ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, diagnostico_calidad, nse_info = process_quality_cached(
                     sales_df,
                     nse_df,
+                    fuente_nse=fuente_nse,
+                    estado_validacion_nse=estado_validacion_nse,
+                    advertencias_nse=advertencias_nse,
                 )
             cache.clear()
             cache[cache_key] = (ventas_nse, resumen_limpieza, summary, semaforo, calidad_varianza, diagnostico_calidad, nse_info)
@@ -741,6 +792,15 @@ def render_quality_view() -> None:
         """
     )
 
+
+    st.subheader("Configuración de nivel socioeconómico")
+    st.caption(
+        "La app usa la base NSE default precargada si no se sube una personalizada válida. "
+        "Las bases personalizadas se validan antes del cruce y, si fallan, no rompen la app."
+    )
+    st.write(f"**Opción seleccionada:** {st.session_state.get('nse_mode', 'Usar base NSE default')}")
+    st.write(f"**Ubicación de bases NSE default:** `{get_default_nse_path()}`")
+
     if not require_processed():
         return
 
@@ -789,6 +849,20 @@ def render_quality_view() -> None:
 
     st.subheader("Cruce NSE")
     st.info(nse_info.get("mensaje", "NSE no aplicado."))
+    nse_c1, nse_c2, nse_c3, nse_c4 = st.columns(4)
+    with nse_c1:
+        render_kpi_card("Fuente NSE usada", nse_info.get("fuente_nse_usada", "default"), nse_info.get("estado_validacion_nse", ""))
+    with nse_c2:
+        render_kpi_card("Registros con NSE", f"{nse_info.get('porcentaje_match_nse', 0):.1f}%", "NSE asignado")
+    with nse_c3:
+        render_kpi_card("Sin NSE asignado", f"{int(nse_info.get('registros_sin_match_nse', 0)):,}", "Marcados como NSE_no_asignado")
+    with nse_c4:
+        advertencias = nse_info.get("advertencias_nse", []) or []
+        render_kpi_card("Advertencias NSE", f"{len(advertencias):,}", "Validación y cruce")
+    if nse_info.get("advertencias_nse"):
+        with st.expander("Advertencias del cruce NSE", expanded=True):
+            for warning in nse_info.get("advertencias_nse", []):
+                st.warning(warning)
     if "categoria_est_socio" in ventas.columns:
         st.dataframe(
             ventas["categoria_est_socio"]

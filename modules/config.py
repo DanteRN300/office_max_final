@@ -58,6 +58,13 @@ LEER_SOLO_COLUMNAS_NECESARIAS = True
 # Formatos rápidos: Parquet es mucho más veloz que CSV/Excel para bases grandes.
 PERMITIR_PARQUET = True
 
+# Carpeta y archivo oficial para bases NSE default precargadas.
+DEFAULT_NSE_DIR = "data/default_nse"
+DEFAULT_NSE_FILENAME = "base_nse_default.csv"
+
+# Valores NSE canónicos que acepta el motor de configuración.
+NSE_CATEGORIAS_VALIDAS = ["bajo", "medio bajo", "medio alto", "alto"]
+
 
 UMBRAL_CV_VAR_ALTA = 2.0
 UMBRAL_REGISTROS_REMOVIDOS_AMARILLO = 0.25

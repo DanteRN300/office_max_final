@@ -1,0 +1,33 @@
+﻿key,ubica_geo,estado,municipio,est_socio,categoria_est_socio
+Aguascalientes-Aguascalientes,1001,Aguascalientes,Aguascalientes,3,medio alto
+Mexicali-Baja California,2002,Baja California,Mexicali,3,medio alto
+La Paz-Baja California Sur,3003,Baja California Sur,La Paz,3,medio alto
+Campeche-Campeche,4002,Campeche,Campeche,2,medio bajo
+Tuxtla Gutierrez-Chiapas,7101,Chiapas,Tuxtla Gutierrez,2,medio bajo
+Chihuahua-Chihuahua,8019,Chihuahua,Chihuahua,3,medio alto
+Saltillo-Coahuila,5030,Coahuila,Saltillo,3,medio alto
+Colima-Colima,6002,Colima,Colima,3,medio alto
+Cuauhtemoc-Ciudad de Mexico,9015,Ciudad de Mexico,Cuauhtemoc,4,alto
+Durango-Durango,10005,Durango,Durango,3,medio alto
+Leon-Guanajuato,11020,Guanajuato,Leon,3,medio alto
+Acapulco de Juarez-Guerrero,12001,Guerrero,Acapulco de Juarez,2,medio bajo
+Pachuca de Soto-Hidalgo,13048,Hidalgo,Pachuca de Soto,3,medio alto
+Guadalajara-Jalisco,14039,Jalisco,Guadalajara,4,alto
+Toluca-Mexico,15106,Estado de Mexico,Toluca,3,medio alto
+Morelia-Michoacan,16053,Michoacan,Morelia,3,medio alto
+Cuernavaca-Morelos,17007,Morelos,Cuernavaca,3,medio alto
+Tepic-Nayarit,18017,Nayarit,Tepic,3,medio alto
+Monterrey-Nuevo Leon,19039,Nuevo Leon,Monterrey,4,alto
+Oaxaca de Juarez-Oaxaca,20067,Oaxaca,Oaxaca de Juarez,2,medio bajo
+Puebla-Puebla,21114,Puebla,Puebla,3,medio alto
+Queretaro-Queretaro,22014,Queretaro,Queretaro,4,alto
+Benito Juarez-Quintana Roo,23005,Quintana Roo,Benito Juarez,3,medio alto
+San Luis Potosi-San Luis Potosi,24028,San Luis Potosi,San Luis Potosi,3,medio alto
+Culiacan-Sinaloa,25006,Sinaloa,Culiacan,3,medio alto
+Hermosillo-Sonora,26030,Sonora,Hermosillo,3,medio alto
+Centro-Tabasco,27004,Tabasco,Centro,3,medio alto
+Tampico-Tamaulipas,28038,Tamaulipas,Tampico,3,medio alto
+Tlaxcala-Tlaxcala,29033,Tlaxcala,Tlaxcala,3,medio alto
+Veracruz-Veracruz,30193,Veracruz,Veracruz,3,medio alto
+Merida-Yucatan,31050,Yucatan,Merida,4,alto
+Zacatecas-Zacatecas,32056,Zacatecas,Zacatecas,3,medio alto
