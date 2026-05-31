@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from scipy import stats
 
 from .config import MIN_OBSERVACIONES, MIN_PRECIOS_DISTINTOS
 from .utils import build_quarter_label, parse_transaction_dates
@@ -772,60 +773,598 @@ def calculate_elasticity(
         else _empty_elasticidades_periodo()
     )
 
-    resultados = []
 
-    for bloque in bloques:
-        df_bloque = ventas[ventas["mes"].isin(bloque["meses"])].copy()
 
-        for sku, df_sku in df_bloque.groupby("prod_nbr"):
-            n_obs = len(df_sku)
-            precios_distintos = df_sku["precio_unitario"].round(2).nunique()
 
-            estimacion = mejor_estimacion_con_fallback(
-                df_sku_trimestre=df_sku,
-                sku=sku,
-                bloque=bloque,
-                df_bloque=df_bloque,
-                ventas_completa=ventas,
-            )
+def _fast_mode_by_group(df: pd.DataFrame, group_cols: list[str], value_col: str) -> pd.DataFrame:
+    """Moda por grupo sin groupby.apply para descriptores de elasticidad."""
+    if value_col not in df.columns or df.empty:
+        return pd.DataFrame(columns=group_cols + [value_col])
+    tmp = df[group_cols + [value_col]].copy()
+    tmp[value_col] = tmp[value_col].replace(["", " ", "nan", "NaN", "None", "none", "null", "Null"], np.nan)
+    tmp = tmp.dropna(subset=[value_col])
+    if tmp.empty:
+        return pd.DataFrame(columns=group_cols + [value_col])
+    counts = tmp.groupby(group_cols + [value_col], observed=True, sort=False).size().reset_index(name="_n")
+    counts = counts.sort_values(group_cols + ["_n"], ascending=[True] * len(group_cols) + [False])
+    return counts.drop_duplicates(group_cols, keep="first")[group_cols + [value_col]]
 
-            beta = estimacion["Elasticidad"]
 
-            resultados.append(
-                {
-                    "prod_nbr": sku,
-                    "SKU": sku,
+def _attach_fast_modes(base: pd.DataFrame, ventas: pd.DataFrame, group_cols: list[str], descriptoras: list[str]) -> pd.DataFrame:
+    out = base.copy()
+    for col in descriptoras:
+        if col in ventas.columns:
+            out = out.merge(_fast_mode_by_group(ventas, group_cols, col), on=group_cols, how="left")
+        elif col not in out.columns:
+            out[col] = np.nan
+    return out
+
+
+def _assign_period_columns(df: pd.DataFrame, periodo_tipo: str) -> pd.DataFrame:
+    """Agrega columnas de periodo a una copia para cálculos vectorizados."""
+    out = df.copy()
+    if periodo_tipo == "mensual":
+        out["periodo"] = out["mes"].astype(str)
+        out["fecha_inicio"] = out["mes"].dt.to_timestamp(how="start").dt.date
+        out["fecha_fin"] = out["mes"].dt.to_timestamp(how="end").dt.date
+    elif periodo_tipo == "trimestral":
+        mapa = {}
+        for bloque in build_three_month_blocks(out):
+            for mes in bloque["meses"]:
+                mapa[mes] = {
+                    "periodo": bloque["trimestre"],
+                    "fecha_inicio": bloque["mes_inicio"].to_timestamp(how="start").date(),
+                    "fecha_fin": bloque["mes_fin"].to_timestamp(how="end").date(),
                     "periodo_3m": bloque["periodo_3m"],
                     "trimestre": bloque["trimestre"],
                     "mes_inicio": str(bloque["mes_inicio"]),
                     "mes_fin": str(bloque["mes_fin"]),
-                    "Beta": estimacion["Beta"],
-                    "Elasticidad": estimacion["Elasticidad"],
-                    "Alfa": estimacion["Alfa"],
-                    "R2": estimacion["R2"],
-                    "P_Value": estimacion["P_Value"],
-                    "Observaciones": n_obs,
-                    "Precios_Distintos": precios_distintos,
-                    "Observaciones_Modelo": estimacion["Observaciones_Modelo"],
-                    "Precios_Distintos_Modelo": estimacion["Precios_Distintos_Modelo"],
-                    "Fuente_Elasticidad": estimacion["Fuente_Elasticidad"],
-                    "Motivo_Modelo": estimacion["Motivo_Modelo"],
-                    "Tiene_Promocion": df_sku["tiene_promocion"].max(),
-                    "Num_Promociones": df_sku["num_promociones"].sum(),
-                    "Diagnostico": diagnosticar_elasticidad(beta),
-                    "dept_nm": _moda_segura(df_sku, "dept_nm"),
-                    "subdept_nm": _moda_segura(df_sku, "subdept_nm"),
-                    "marca": _moda_segura(df_sku, "marca"),
-                    "tipo_marca": _moda_segura(df_sku, "tipo_marca"),
-                    "categoria_est_socio": _moda_segura(df_sku, "categoria_est_socio"),
-                    "estado": _moda_segura(df_sku, "estado"),
+                }
+        meta = out["mes"].map(mapa)
+        out = out[meta.notna()].copy()
+        if out.empty:
+            return out
+        meta_df = pd.DataFrame(out["mes"].map(mapa).tolist(), index=out.index)
+        for col in meta_df.columns:
+            out[col] = meta_df[col].values
+        return out
+    elif periodo_tipo == "semestral":
+        meses_ordenados = sorted(out["mes"].dropna().unique())
+        mapa = {}
+        for i in range(0, len(meses_ordenados), 6):
+            meses_bloque = meses_ordenados[i : i + 6]
+            if len(meses_bloque) < 6:
+                continue
+            fecha_inicio = meses_bloque[0].to_timestamp(how="start").date()
+            fecha_fin = meses_bloque[-1].to_timestamp(how="end").date()
+            periodo = _period_label(periodo_tipo, fecha_inicio, fecha_fin)
+            for mes in meses_bloque:
+                mapa[mes] = {"periodo": periodo, "fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin}
+        meta = out["mes"].map(mapa)
+        out = out[meta.notna()].copy()
+        if out.empty:
+            return out
+        meta_df = pd.DataFrame(out["mes"].map(mapa).tolist(), index=out.index)
+        for col in meta_df.columns:
+            out[col] = meta_df[col].values
+        return out
+    elif periodo_tipo == "anual":
+        out["periodo"] = out["mes"].dt.year.astype(str)
+        anio_inicio = out.groupby("periodo", observed=True)["mes"].transform("min")
+        anio_fin = out.groupby("periodo", observed=True)["mes"].transform("max")
+        out["fecha_inicio"] = anio_inicio.dt.to_timestamp(how="start").dt.date
+        out["fecha_fin"] = anio_fin.dt.to_timestamp(how="end").dt.date
+    else:
+        meses = sorted(out["mes"].dropna().unique())
+        if not meses:
+            return out.iloc[0:0].copy()
+        out["periodo"] = periodo_tipo
+        out["fecha_inicio"] = meses[0].to_timestamp(how="start").date()
+        out["fecha_fin"] = meses[-1].to_timestamp(how="end").date()
+    return out
+
+
+def _build_model_rows(df_periodo: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    """Replica preparar_df_modelo por grupo, pero en una sola agregación vectorizada."""
+    cols = group_cols + ["fecha_dia", "precio_modelo", "qty", "net_sale"]
+    if df_periodo.empty:
+        return pd.DataFrame(columns=group_cols + ["qty_modelo", "precio_modelo"])
+    tmp = df_periodo[cols].dropna(subset=["fecha_dia", "precio_modelo", "qty", "net_sale"]).copy()
+    tmp = tmp[(tmp["qty"] > 0) & (tmp["net_sale"] > 0) & (tmp["precio_modelo"] > 0)]
+    if tmp.empty:
+        return pd.DataFrame(columns=group_cols + ["qty_modelo", "precio_modelo"])
+    model = (
+        tmp.groupby(group_cols + ["fecha_dia", "precio_modelo"], observed=True, sort=False, as_index=False)
+        .agg(qty_modelo=("qty", "sum"), venta_modelo=("net_sale", "sum"))
+    )
+    model["precio_modelo"] = model["venta_modelo"] / model["qty_modelo"]
+    model = model.replace([np.inf, -np.inf], np.nan).dropna(subset=["qty_modelo", "precio_modelo"])
+    model = model[(model["qty_modelo"] > 0) & (model["precio_modelo"] > 0)].copy()
+    return model
+
+
+def _estimate_loglog_grouped(model: pd.DataFrame, group_cols: list[str], fuente: str) -> pd.DataFrame:
+    """Estima OLS log-log para todos los grupos con fórmulas cerradas."""
+    result_cols = group_cols + [
+        "Beta",
+        "Elasticidad",
+        "Alfa",
+        "R2",
+        "P_Value",
+        "Observaciones_Modelo",
+        "Precios_Distintos_Modelo",
+        "Fuente_Elasticidad",
+        "Motivo_Modelo",
+    ]
+    if model.empty:
+        return pd.DataFrame(columns=result_cols)
+
+    m = model[group_cols + ["qty_modelo", "precio_modelo"]].copy()
+    m["log_qty"] = np.log(m["qty_modelo"])
+    m["log_precio"] = np.log(m["precio_modelo"])
+    m = m.replace([np.inf, -np.inf], np.nan).dropna(subset=["log_qty", "log_precio"])
+    if m.empty:
+        return pd.DataFrame(columns=result_cols)
+
+    m["x2"] = m["log_precio"] ** 2
+    m["y2"] = m["log_qty"] ** 2
+    m["xy"] = m["log_precio"] * m["log_qty"]
+    agg = (
+        m.groupby(group_cols, observed=True, sort=False)
+        .agg(
+            Observaciones_Modelo=("log_qty", "size"),
+            Precios_Distintos_Modelo=("precio_modelo", "nunique"),
+            Qty_Distintas_Modelo=("qty_modelo", "nunique"),
+            sum_x=("log_precio", "sum"),
+            sum_y=("log_qty", "sum"),
+            sum_x2=("x2", "sum"),
+            sum_y2=("y2", "sum"),
+            sum_xy=("xy", "sum"),
+        )
+        .reset_index()
+    )
+
+    n = agg["Observaciones_Modelo"].astype(float)
+    sxx = agg["sum_x2"] - (agg["sum_x"] ** 2) / n
+    syy = agg["sum_y2"] - (agg["sum_y"] ** 2) / n
+    sxy = agg["sum_xy"] - (agg["sum_x"] * agg["sum_y"]) / n
+
+    valid = (agg["Observaciones_Modelo"] >= MIN_OBSERVACIONES) & (agg["Precios_Distintos_Modelo"] >= MIN_PRECIOS_DISTINTOS) & (sxx > 0)
+    constant_qty = valid & (agg["Qty_Distintas_Modelo"] < 2)
+    model_ok = valid & ~constant_qty
+
+    agg["Beta"] = np.nan
+    agg["Elasticidad"] = np.nan
+    agg["Alfa"] = np.nan
+    agg["R2"] = np.nan
+    agg["P_Value"] = np.nan
+    agg["Motivo_Modelo"] = "Modelo no estimable"
+
+    agg.loc[agg["Observaciones_Modelo"] < MIN_OBSERVACIONES, "Motivo_Modelo"] = f"Menos de {MIN_OBSERVACIONES} observaciones agregadas"
+    agg.loc[(agg["Observaciones_Modelo"] >= MIN_OBSERVACIONES) & (agg["Precios_Distintos_Modelo"] < MIN_PRECIOS_DISTINTOS), "Motivo_Modelo"] = "Sin variación suficiente de precio"
+
+    agg.loc[constant_qty, "Beta"] = 0.0
+    agg.loc[constant_qty, "Elasticidad"] = 0.0
+    agg.loc[constant_qty, "Alfa"] = agg.loc[constant_qty, "sum_y"] / n[constant_qty]
+    agg.loc[constant_qty, "R2"] = 0.0
+    agg.loc[constant_qty, "P_Value"] = 1.0
+    agg.loc[constant_qty, "Motivo_Modelo"] = "Cantidad agregada constante; elasticidad aproximada a 0"
+
+    beta = sxy[model_ok] / sxx[model_ok]
+    alfa = (agg.loc[model_ok, "sum_y"] / n[model_ok]) - beta * (agg.loc[model_ok, "sum_x"] / n[model_ok])
+    r2 = (sxy[model_ok] ** 2) / (sxx[model_ok] * syy[model_ok])
+    r2 = r2.where(np.isfinite(r2), np.nan).clip(lower=0, upper=1)
+    sse = (syy[model_ok] - beta * sxy[model_ok]).clip(lower=0)
+    df_resid = n[model_ok] - 2
+    se_beta = np.sqrt((sse / df_resid) / sxx[model_ok])
+    t_stat = beta / se_beta
+    p_values = pd.Series(2 * stats.t.sf(np.abs(t_stat), df_resid), index=beta.index)
+    p_values = p_values.where(np.isfinite(p_values), np.nan)
+
+    agg.loc[model_ok, "Beta"] = beta
+    agg.loc[model_ok, "Elasticidad"] = beta
+    agg.loc[model_ok, "Alfa"] = alfa
+    agg.loc[model_ok, "R2"] = r2
+    agg.loc[model_ok, "P_Value"] = p_values
+    agg.loc[model_ok, "Motivo_Modelo"] = "Modelo estimado correctamente"
+    agg["Fuente_Elasticidad"] = fuente
+
+    return agg[result_cols].replace([np.inf, -np.inf], np.nan)
+
+
+def _raw_metrics_grouped(df_periodo: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if df_periodo.empty:
+        return pd.DataFrame(columns=group_cols)
+    tmp = df_periodo.copy()
+    if "margen_total" not in tmp.columns:
+        tmp["margen_total"] = np.nan
+    return (
+        tmp.groupby(group_cols, observed=True, sort=False)
+        .agg(
+            num_observaciones=("prod_nbr", "size"),
+            num_precios_distintos=("precio_unitario", lambda s: s.round(2).nunique()),
+            precio_promedio=("precio_unitario", "mean"),
+            unidades_promedio=("qty", "mean"),
+            ingreso_promedio=("net_sale", "mean"),
+            margen_promedio=("margen_total", "mean"),
+        )
+        .reset_index()
+    )
+
+
+def _evaluate_confidence_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    elasticidad = pd.to_numeric(out.get("elasticidad"), errors="coerce")
+    r2 = pd.to_numeric(out.get("r2"), errors="coerce")
+    p_value = pd.to_numeric(out.get("p_value"), errors="coerce")
+    n_obs = pd.to_numeric(out.get("num_observaciones"), errors="coerce").fillna(0)
+    n_modelo = pd.to_numeric(out.get("Observaciones_Modelo"), errors="coerce").fillna(0)
+    precios = pd.to_numeric(out.get("num_precios_distintos"), errors="coerce").fillna(0)
+    motivo = out.get("Motivo_Modelo", pd.Series("", index=out.index)).fillna("").astype(str)
+
+    no_usable = elasticidad.isna() | ~np.isfinite(elasticidad) | (elasticidad >= 0) | (n_obs < MIN_OBSERVACIONES) | (n_modelo < MIN_OBSERVACIONES) | (precios < 3)
+    baja = (~no_usable) & ((n_obs < 8) | (n_modelo < 5) | r2.isna() | (r2 < 0.15) | (p_value > 0.20) | (elasticidad < -10))
+    alta = (~no_usable) & (~baja) & (n_obs >= 15) & (n_modelo >= 10) & (precios >= 4) & (r2 >= 0.50) & (elasticidad >= -5) & (elasticidad < 0)
+
+    out["confianza_elasticidad"] = np.select([no_usable, baja, alta], ["No usable", "Baja", "Alta"], default="Media")
+    out["recomendable_elasticidad"] = out["confianza_elasticidad"].isin(["Media", "Alta"])
+    out["razon_no_recomendable"] = ""
+    out.loc[elasticidad.isna() | ~np.isfinite(elasticidad), "razon_no_recomendable"] = motivo.where(motivo.ne(""), "elasticidad NaN o infinita")
+    out.loc[elasticidad > 0, "razon_no_recomendable"] = "elasticidad positiva"
+    out.loc[elasticidad == 0, "razon_no_recomendable"] = "elasticidad cero sospechosa"
+    out.loc[(out["razon_no_recomendable"] == "") & ((n_obs < MIN_OBSERVACIONES) | (n_modelo < MIN_OBSERVACIONES)), "razon_no_recomendable"] = "datos insuficientes"
+    out.loc[(out["razon_no_recomendable"] == "") & (precios < 3), "razon_no_recomendable"] = "menos de 3 precios distintos"
+    out.loc[(out["razon_no_recomendable"] == "") & baja & ((n_obs < 8) | (n_modelo < 5)), "razon_no_recomendable"] = "pocos datos"
+    out.loc[(out["razon_no_recomendable"] == "") & baja & (r2.isna() | (r2 < 0.15)), "razon_no_recomendable"] = "bajo R2"
+    out.loc[(out["razon_no_recomendable"] == "") & baja & (p_value > 0.20), "razon_no_recomendable"] = "p-value alto"
+    out.loc[(out["razon_no_recomendable"] == "") & baja & (elasticidad < -10), "razon_no_recomendable"] = "comportamiento inestable"
+    return out
+
+
+def _period_estimates_fast(ventas: pd.DataFrame, periodo_tipo: str, entity_cols: list[str], fuente: str) -> pd.DataFrame:
+    df_periodo = _assign_period_columns(ventas, periodo_tipo)
+    group_cols = entity_cols + ["periodo", "fecha_inicio", "fecha_fin"]
+    if df_periodo.empty:
+        return pd.DataFrame(columns=group_cols)
+    model = _build_model_rows(df_periodo, group_cols)
+    estimates = _estimate_loglog_grouped(model, group_cols, fuente)
+    metrics = _raw_metrics_grouped(df_periodo, group_cols)
+    out = metrics.merge(estimates, on=group_cols, how="left")
+    return out.replace([np.inf, -np.inf], np.nan)
+
+def _row_elasticidad_periodo(
+    sku: str,
+    df_sku: pd.DataFrame,
+    bloque: dict,
+    estimacion: dict,
+    periodo_tipo: str,
+    categoria: str | None = None,
+    departamento: str | None = None,
+) -> dict:
+    metricas = _metricas_periodo(df_sku)
+    confianza = evaluar_confianza_elasticidad(estimacion, metricas)
+    return {
+        "SKU": str(sku),
+        "categoria": categoria if categoria is not None else _moda_segura(df_sku, "subdept_nm"),
+        "departamento": departamento if departamento is not None else _moda_segura(df_sku, "dept_nm"),
+        "periodo_tipo": periodo_tipo,
+        "periodo": bloque["periodo"],
+        "fecha_inicio": bloque["fecha_inicio"],
+        "fecha_fin": bloque["fecha_fin"],
+        "elasticidad": _finite_or_none(estimacion.get("Elasticidad")),
+        "r2": _finite_or_none(estimacion.get("R2")),
+        "p_value": _finite_or_none(estimacion.get("P_Value")),
+        **metricas,
+        **confianza,
+    }
+
+
+def _fallback_categoria_departamento(
+    df_sku: pd.DataFrame,
+    df_periodo: pd.DataFrame,
+    periodo_tipo: str,
+) -> dict | None:
+    """Intenta fallback confiable por categoría y departamento para un SKU-periodo."""
+    categoria = _moda_segura(df_sku, "subdept_nm")
+    departamento = _moda_segura(df_sku, "dept_nm")
+
+    candidatos: list[tuple[str, pd.DataFrame]] = []
+    if pd.notna(categoria) and "subdept_nm" in df_periodo.columns:
+        candidatos.append(("Categoría/departamento-periodo", df_periodo[df_periodo["subdept_nm"] == categoria].copy()))
+    if pd.notna(departamento) and "dept_nm" in df_periodo.columns:
+        candidatos.append(("Departamento-periodo", df_periodo[df_periodo["dept_nm"] == departamento].copy()))
+
+    for fuente, df_fallback in candidatos:
+        est = estimar_elasticidad_loglog(df_fallback, fuente=f"{fuente}-{periodo_tipo}")
+        metricas = _metricas_periodo(df_fallback)
+        confianza = evaluar_confianza_elasticidad(est, metricas)
+        if confianza["recomendable_elasticidad"]:
+            est["Motivo_Modelo"] = f"Fallback confiable: {fuente}"
+            return est
+    return None
+
+
+def _calculate_elasticity_period_prepared(ventas: pd.DataFrame, periodo_tipo: str) -> pd.DataFrame:
+    """Calcula elasticidades_periodo con agregaciones vectorizadas."""
+    if periodo_tipo not in PERIODOS_ELASTICIDAD:
+        raise ValueError(f"periodo_tipo inválido: {periodo_tipo}. Opciones: {', '.join(PERIODOS_ELASTICIDAD)}")
+    if ventas.empty:
+        return _empty_elasticidades_periodo()
+
+    if periodo_tipo == "categoria_departamento":
+        group_cols = [col for col in ["subdept_nm", "dept_nm"] if col in ventas.columns]
+        if not group_cols:
+            return _empty_elasticidades_periodo()
+        base = _period_estimates_fast(ventas, periodo_tipo, group_cols, "Categoría/departamento-global")
+        if base.empty:
+            return _empty_elasticidades_periodo()
+        if "subdept_nm" not in base.columns:
+            base["subdept_nm"] = np.nan
+        if "dept_nm" not in base.columns:
+            base["dept_nm"] = np.nan
+        out = base.rename(
+            columns={
+                "subdept_nm": "categoria",
+                "dept_nm": "departamento",
+                "Elasticidad": "elasticidad",
+                "R2": "r2",
+                "P_Value": "p_value",
+            }
+        )
+        out["SKU"] = out["departamento"].astype(str) + "|" + out["categoria"].astype(str)
+        out["periodo_tipo"] = periodo_tipo
+        out = _evaluate_confidence_frame(out)
+        out = out.replace([np.inf, -np.inf], np.nan)
+        return out[ELASTICIDADES_PERIODO_COLUMNS]
+
+    base = _period_estimates_fast(ventas, periodo_tipo, ["prod_nbr"], f"SKU-{periodo_tipo}")
+    if base.empty:
+        return _empty_elasticidades_periodo()
+
+    descriptoras = ["subdept_nm", "dept_nm"]
+    period_df = _assign_period_columns(ventas, periodo_tipo)
+    base = _attach_fast_modes(base, period_df, ["prod_nbr", "periodo", "fecha_inicio", "fecha_fin"], descriptoras)
+    base = base.rename(
+        columns={
+            "prod_nbr": "SKU",
+            "subdept_nm": "categoria",
+            "dept_nm": "departamento",
+            "Elasticidad": "elasticidad",
+            "R2": "r2",
+            "P_Value": "p_value",
+        }
+    )
+    base["periodo_tipo"] = periodo_tipo
+    base = _evaluate_confidence_frame(base)
+
+    # Fallback vectorizado: para filas no recomendables, intenta primero categoría y luego departamento
+    # del mismo periodo. Evita estimar un modelo por SKU-periodo, que era el principal cuello de botella.
+    needs_fallback = ~base["recomendable_elasticidad"]
+    if needs_fallback.any():
+        fallback_sources = []
+        if "subdept_nm" in period_df.columns:
+            cat = _period_estimates_fast(ventas, periodo_tipo, ["subdept_nm"], f"Categoría/departamento-periodo-{periodo_tipo}")
+            if not cat.empty:
+                cat = cat.rename(
+                    columns={
+                        "subdept_nm": "categoria",
+                        "Elasticidad": "elasticidad_fb",
+                        "R2": "r2_fb",
+                        "P_Value": "p_value_fb",
+                        "Observaciones_Modelo": "Observaciones_Modelo_fb",
+                        "Precios_Distintos_Modelo": "Precios_Distintos_Modelo_fb",
+                        "Motivo_Modelo": "Motivo_Modelo_fb",
+                    }
+                )
+                cat["_fallback_nivel"] = "categoría/departamento"
+                fallback_sources.append((cat, ["categoria", "periodo", "fecha_inicio", "fecha_fin"]))
+        if "dept_nm" in period_df.columns:
+            dept = _period_estimates_fast(ventas, periodo_tipo, ["dept_nm"], f"Departamento-periodo-{periodo_tipo}")
+            if not dept.empty:
+                dept = dept.rename(
+                    columns={
+                        "dept_nm": "departamento",
+                        "Elasticidad": "elasticidad_fb",
+                        "R2": "r2_fb",
+                        "P_Value": "p_value_fb",
+                        "Observaciones_Modelo": "Observaciones_Modelo_fb",
+                        "Precios_Distintos_Modelo": "Precios_Distintos_Modelo_fb",
+                        "Motivo_Modelo": "Motivo_Modelo_fb",
+                    }
+                )
+                dept["_fallback_nivel"] = "departamento"
+                fallback_sources.append((dept, ["departamento", "periodo", "fecha_inicio", "fecha_fin"]))
+
+        for fallback_df, merge_cols in fallback_sources:
+            left = base.loc[needs_fallback, ["SKU", *merge_cols]].copy()
+            left["_base_index"] = left.index
+            candidate = left.merge(fallback_df, on=merge_cols, how="left")
+            if candidate.empty:
+                continue
+            candidate_eval = pd.DataFrame(
+                {
+                    "SKU": candidate["SKU"],
+                    "elasticidad": candidate["elasticidad_fb"],
+                    "r2": candidate["r2_fb"],
+                    "p_value": candidate["p_value_fb"],
+                    "num_observaciones": candidate["num_observaciones"],
+                    "num_precios_distintos": candidate["num_precios_distintos"],
+                    "Observaciones_Modelo": candidate["Observaciones_Modelo_fb"],
+                    "Motivo_Modelo": candidate["Motivo_Modelo_fb"],
                 }
             )
+            candidate_eval = _evaluate_confidence_frame(candidate_eval)
+            usable = candidate_eval["recomendable_elasticidad"].fillna(False)
+            if not usable.any():
+                continue
+            usable_candidates = candidate.loc[usable.values].copy().drop_duplicates("_base_index", keep="first")
+            target_idx = usable_candidates["_base_index"].astype(int).to_numpy()
+            base.loc[target_idx, "elasticidad"] = usable_candidates["elasticidad_fb"].values
+            base.loc[target_idx, "r2"] = usable_candidates["r2_fb"].values
+            base.loc[target_idx, "p_value"] = usable_candidates["p_value_fb"].values
+            base.loc[target_idx, "Observaciones_Modelo"] = usable_candidates["Observaciones_Modelo_fb"].values
+            base.loc[target_idx, "Precios_Distintos_Modelo"] = usable_candidates["Precios_Distintos_Modelo_fb"].values
+            base.loc[target_idx, "Motivo_Modelo"] = "Fallback confiable: " + usable_candidates["_fallback_nivel"].astype(str).values
+            base = _evaluate_confidence_frame(base)
+            needs_fallback = ~base["recomendable_elasticidad"]
+            if not needs_fallback.any():
+                break
 
-    elasticidad = pd.DataFrame(resultados)
-    if not elasticidad.empty:
-        elasticidad = elasticidad.replace([np.inf, -np.inf], np.nan)
-        elasticidad = elasticidad.sort_values(by=["prod_nbr", "mes_inicio"]).reset_index(drop=True)
+    base = base.replace([np.inf, -np.inf], np.nan).sort_values(
+        by=["SKU", "periodo_tipo", "fecha_inicio"], kind="stable"
+    ).reset_index(drop=True)
+    return base[ELASTICIDADES_PERIODO_COLUMNS]
+
+
+
+
+def _apply_legacy_fallbacks(base: pd.DataFrame, ventas: pd.DataFrame, period_df: pd.DataFrame) -> pd.DataFrame:
+    """Aplica fallback legacy solo cuando la elasticidad SKU-trimestre es NaN."""
+    out = base.copy()
+    needs = out["Elasticidad"].isna()
+    if not needs.any():
+        return out
+
+    global_sku = _period_estimates_fast(ventas, "global_sku", ["prod_nbr"], "SKU-global")
+    if not global_sku.empty:
+        global_sku = global_sku.drop_duplicates("prod_nbr").rename(
+            columns={c: f"{c}_fb" for c in ["Beta", "Elasticidad", "Alfa", "R2", "P_Value", "Observaciones_Modelo", "Precios_Distintos_Modelo", "Fuente_Elasticidad", "Motivo_Modelo"]}
+        )
+        candidate = out.loc[needs, ["prod_nbr"]].merge(global_sku, on="prod_nbr", how="left")
+        usable = candidate["Elasticidad_fb"].notna()
+        if usable.any():
+            idx = out.index[needs][usable.values]
+            for col in ["Beta", "Elasticidad", "Alfa", "R2", "P_Value", "Observaciones_Modelo", "Precios_Distintos_Modelo", "Fuente_Elasticidad", "Motivo_Modelo"]:
+                out.loc[idx, col] = candidate.loc[usable, f"{col}_fb"].values
+            needs = out["Elasticidad"].isna()
+            if not needs.any():
+                return out
+
+    fallback_specs = []
+    if "subdept_nm" in period_df.columns:
+        fallback_specs.append((["subdept_nm"], "Subdepartamento-trimestre"))
+    if "dept_nm" in period_df.columns:
+        fallback_specs.append((["dept_nm"], "Departamento-trimestre"))
+
+    for entity_cols, fuente in fallback_specs:
+        fallback = _period_estimates_fast(ventas, "trimestral", entity_cols, fuente)
+        if fallback.empty:
+            continue
+        rename_cols = {c: f"{c}_fb" for c in ["Beta", "Elasticidad", "Alfa", "R2", "P_Value", "Observaciones_Modelo", "Precios_Distintos_Modelo", "Fuente_Elasticidad", "Motivo_Modelo"]}
+        fallback = fallback.rename(columns=rename_cols)
+        merge_cols = entity_cols + ["periodo", "fecha_inicio", "fecha_fin"]
+        candidate = out.loc[needs, ["prod_nbr", *merge_cols]].merge(fallback, on=merge_cols, how="left")
+        usable = candidate["Elasticidad_fb"].notna()
+        if usable.any():
+            idx = out.index[needs][usable.values]
+            for col in ["Beta", "Elasticidad", "Alfa", "R2", "P_Value", "Observaciones_Modelo", "Precios_Distintos_Modelo", "Fuente_Elasticidad", "Motivo_Modelo"]:
+                out.loc[idx, col] = candidate.loc[usable, f"{col}_fb"].values
+            needs = out["Elasticidad"].isna()
+            if not needs.any():
+                return out
+
+    return out
+
+
+def _calculate_legacy_quarterly_fast(ventas: pd.DataFrame) -> pd.DataFrame:
+    """Construye la salida trimestral legacy sin ejecutar statsmodels por SKU-periodo."""
+    period_df = _assign_period_columns(ventas, "trimestral")
+    if period_df.empty:
+        return pd.DataFrame()
+
+    base = _period_estimates_fast(ventas, "trimestral", ["prod_nbr"], "SKU-trimestre")
+    if base.empty:
+        return pd.DataFrame()
+
+    meta_cols = ["prod_nbr", "periodo", "fecha_inicio", "fecha_fin", "periodo_3m", "trimestre", "mes_inicio", "mes_fin"]
+    meta = period_df[meta_cols].drop_duplicates()
+    base = base.merge(meta, on=["prod_nbr", "periodo", "fecha_inicio", "fecha_fin"], how="left")
+
+    descriptoras = ["dept_nm", "subdept_nm", "marca", "tipo_marca", "categoria_est_socio", "estado"]
+    base = _attach_fast_modes(base, period_df, ["prod_nbr", "periodo", "fecha_inicio", "fecha_fin"], descriptoras)
+    base = _apply_legacy_fallbacks(base, ventas, period_df)
+
+    promo = (
+        period_df.groupby(["prod_nbr", "periodo", "fecha_inicio", "fecha_fin"], observed=True, sort=False)
+        .agg(Tiene_Promocion=("tiene_promocion", "max"), Num_Promociones=("num_promociones", "sum"))
+        .reset_index()
+    )
+    base = base.merge(promo, on=["prod_nbr", "periodo", "fecha_inicio", "fecha_fin"], how="left")
+
+    out = pd.DataFrame(
+        {
+            "prod_nbr": base["prod_nbr"].astype(str),
+            "SKU": base["prod_nbr"].astype(str),
+            "periodo_3m": base["periodo_3m"],
+            "trimestre": base["trimestre"],
+            "mes_inicio": base["mes_inicio"],
+            "mes_fin": base["mes_fin"],
+            "Beta": base["Beta"],
+            "Elasticidad": base["Elasticidad"],
+            "Alfa": base["Alfa"],
+            "R2": base["R2"],
+            "P_Value": base["P_Value"],
+            "Observaciones": base["num_observaciones"],
+            "Precios_Distintos": base["num_precios_distintos"],
+            "Observaciones_Modelo": base["Observaciones_Modelo"],
+            "Precios_Distintos_Modelo": base["Precios_Distintos_Modelo"],
+            "Fuente_Elasticidad": base["Fuente_Elasticidad"],
+            "Motivo_Modelo": base["Motivo_Modelo"],
+            "Tiene_Promocion": base["Tiene_Promocion"].fillna(0),
+            "Num_Promociones": base["Num_Promociones"].fillna(0),
+            "Diagnostico": base["Elasticidad"].map(diagnosticar_elasticidad),
+        }
+    )
+    for col in descriptoras:
+        out[col] = base[col] if col in base.columns else np.nan
+    return out.replace([np.inf, -np.inf], np.nan).sort_values(by=["prod_nbr", "mes_inicio"]).reset_index(drop=True)
+
+def calculate_elasticity_by_period(
+    ventas_nse: pd.DataFrame,
+    promociones: pd.DataFrame | None = None,
+    periodo_tipo: str = "trimestral",
+) -> pd.DataFrame:
+    """Función general de elasticidad para mensual/trimestral/semestral/anual/global/fallback."""
+    ventas, _ = _preparar_ventas_elasticidad(ventas_nse, promociones)
+    return _calculate_elasticity_period_prepared(ventas, periodo_tipo)
+
+
+def calculate_elasticidades_periodo(
+    ventas_nse: pd.DataFrame,
+    promociones: pd.DataFrame | None = None,
+    periodo_tipos: list[str] | None = None,
+) -> pd.DataFrame:
+    """Construye la tabla interna elasticidades_periodo para todos los niveles solicitados."""
+    periodo_tipos = periodo_tipos or PERIODOS_ELASTICIDAD
+    ventas, _ = _preparar_ventas_elasticidad(ventas_nse, promociones)
+    tablas = [_calculate_elasticity_period_prepared(ventas, periodo_tipo) for periodo_tipo in periodo_tipos]
+    tablas = [tabla for tabla in tablas if tabla is not None and not tabla.empty]
+    if not tablas:
+        return _empty_elasticidades_periodo()
+    elasticidades_periodo = pd.concat(tablas, ignore_index=True)
+    elasticidades_periodo = elasticidades_periodo.replace([np.inf, -np.inf], np.nan)
+    return elasticidades_periodo[ELASTICIDADES_PERIODO_COLUMNS]
+
+def calculate_elasticity(
+    ventas_nse: pd.DataFrame,
+    promociones: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+    """Calcula elasticidad trimestral legacy y tabla multi-periodo con motor vectorizado."""
+    ventas, bloques = _preparar_ventas_elasticidad(ventas_nse, promociones)
+    tablas_periodo = [
+        _calculate_elasticity_period_prepared(ventas, periodo_tipo)
+        for periodo_tipo in PERIODOS_ELASTICIDAD
+    ]
+    tablas_periodo = [tabla for tabla in tablas_periodo if tabla is not None and not tabla.empty]
+    elasticidades_periodo = (
+        pd.concat(tablas_periodo, ignore_index=True)[ELASTICIDADES_PERIODO_COLUMNS]
+        if tablas_periodo
+        else _empty_elasticidades_periodo()
+    )
+
+    elasticidad = _calculate_legacy_quarterly_fast(ventas)
+    elasticidad.attrs["elasticidades_periodo"] = elasticidades_periodo
+    ventas.attrs["elasticidades_periodo"] = elasticidades_periodo
 
     elasticidad.attrs["elasticidades_periodo"] = elasticidades_periodo
     ventas.attrs["elasticidades_periodo"] = elasticidades_periodo
