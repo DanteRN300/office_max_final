@@ -1373,41 +1373,52 @@ def calculate_elasticity(
 
 
 def build_elasticity_download(elasticidad_df: pd.DataFrame) -> pd.DataFrame:
-    """Construye CSV de elasticidad con nombres solicitados."""
-    if elasticidad_df is None or elasticidad_df.empty:
-        return pd.DataFrame()
+    """Construye un CSV limpio de elasticidades, priorizando elasticidades_periodo.
 
-    out = elasticidad_df.copy()
-    rename_map = {
-        "Beta": "beta",
-        "Elasticidad": "elasticidad",
-        "Alfa": "alfa",
-        "R2": "r2",
-        "P_Value": "p-value",
-        "Observaciones": "observaciones",
-        "Diagnostico": "diagnóstico",
-    }
-    out = out.rename(columns=rename_map)
-    columns = [
-        "SKU",
-        "dept_nm",
-        "subdept_nm",
-        "marca",
-        "tipo_marca",
-        "categoria_est_socio",
-        "trimestre",
-        "beta",
-        "elasticidad",
-        "alfa",
-        "r2",
-        "p-value",
-        "observaciones",
-        "diagnóstico",
-    ]
-    for col in columns:
+    Si la entrada contiene ``periodo_tipo`` se asume que ya es la tabla consolidada
+    multi-periodo. Para compatibilidad, si recibe la tabla legacy trimestral se
+    transforma al esquema más cercano posible y se marca como ``trimestral``.
+    """
+    if elasticidad_df is None or elasticidad_df.empty:
+        return pd.DataFrame(columns=ELASTICIDADES_PERIODO_COLUMNS)
+
+    out = elasticidad_df.copy().replace([np.inf, -np.inf], np.nan)
+
+    if "periodo_tipo" not in out.columns:
+        legacy_rename = {
+            "dept_nm": "departamento",
+            "subdept_nm": "categoria",
+            "trimestre": "periodo",
+            "mes_inicio": "fecha_inicio",
+            "mes_fin": "fecha_fin",
+            "Elasticidad": "elasticidad",
+            "R2": "r2",
+            "P_Value": "p_value",
+            "Observaciones": "num_observaciones",
+            "Precios_Distintos": "num_precios_distintos",
+        }
+        out = out.rename(columns=legacy_rename)
+        out["periodo_tipo"] = "trimestral"
+
+    for col in ELASTICIDADES_PERIODO_COLUMNS:
         if col not in out.columns:
             out[col] = np.nan
-    return out[columns]
+
+    out = out[ELASTICIDADES_PERIODO_COLUMNS].copy()
+    out = out.replace([np.inf, -np.inf], np.nan)
+
+    # Evita objetos complejos y NaN problemáticos en el CSV descargable.
+    for col in out.columns:
+        if pd.api.types.is_object_dtype(out[col]) or str(out[col].dtype).startswith("category"):
+            out[col] = out[col].map(
+                lambda value: ""
+                if value is None or (isinstance(value, float) and pd.isna(value))
+                else str(value)
+                if isinstance(value, (list, tuple, dict, set))
+                else value
+            )
+    out = out.where(pd.notna(out), "")
+    return out
 
 
 def build_dynamic_explanation_elasticity(
