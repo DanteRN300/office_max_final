@@ -161,6 +161,14 @@ def simulate_pricing_cached(
     return simulate_pricing_scenarios(ventas_base_elasticidad, elasticidad, bloques)
 
 
+@st.cache_data(show_spinner=False, max_entries=5)
+def build_historical_sales_ml_cached(ventas_nse: pd.DataFrame) -> dict:
+    """Entrena modelos ML ligeros para entender ventas históricas antes del pronóstico."""
+    from modules.historical_ml import build_historical_sales_ml_summary
+
+    return build_historical_sales_ml_summary(ventas_nse)
+
+
 @st.cache_data(show_spinner=False, max_entries=10)
 def build_elasticity_curve_data(
     curva_df: pd.DataFrame,
@@ -898,6 +906,43 @@ def render_quality_view() -> None:
     with st.expander("Diagnóstico de calidad consolidado"):
         st.dataframe(diagnostico_calidad, use_container_width=True)
 
+    st.subheader("Comportamiento histórico de ventas con Machine Learning")
+    st.markdown(
+        """
+        Antes de generar un pronóstico de ventas, la herramienta resume el comportamiento histórico
+        con dos modelos supervisados: **regresión logística** y **Random Forest**. Ambos modelos
+        clasifican meses SKU con venta alta vs. baja para identificar señales históricas asociadas
+        a precio, temporalidad, categoría y geografía.
+        """
+    )
+    if st.button("Analizar ventas históricas con regresión logística y Random Forest", use_container_width=True):
+        with st.spinner("Entrenando modelos ML sobre ventas históricas..."):
+            ml_summary = build_historical_sales_ml_cached(ventas)
+
+        if ml_summary.get("status") != "ok":
+            st.warning(ml_summary.get("message", "No se pudo entrenar el análisis histórico con ML."))
+        else:
+            st.success(ml_summary.get("message", "Modelos históricos entrenados correctamente."))
+            summary_df = ml_summary.get("dataset_summary", pd.DataFrame())
+            if summary_df is not None and not summary_df.empty:
+                st.caption("Base de entrenamiento SKU-mes usada antes de cualquier pronóstico.")
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+            metrics_df = ml_summary.get("metrics", pd.DataFrame())
+            if metrics_df is not None and not metrics_df.empty:
+                st.caption("Desempeño comparativo de los modelos históricos.")
+                st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+            importance_df = ml_summary.get("feature_importance", pd.DataFrame())
+            if importance_df is not None and not importance_df.empty:
+                st.caption("Variables que más explican el comportamiento histórico según cada modelo.")
+                st.dataframe(importance_df, use_container_width=True, hide_index=True)
+
+            segments_df = ml_summary.get("segments", pd.DataFrame())
+            if segments_df is not None and not segments_df.empty:
+                st.caption("Segmentos con mayor probabilidad histórica de venta alta.")
+                st.dataframe(segments_df, use_container_width=True, hide_index=True)
+
     st.subheader("Vista previa de ventas_limpias")
     st.dataframe(ventas.head(MAX_ROWS_PREVIEW), use_container_width=True)
     st.success("La base está lista. Pasa a Elasticidad o Pricing cuando quieras calcular esas vistas.")
@@ -931,6 +976,12 @@ def render_elasticity_view() -> None:
 
     if elasticidades_periodo is None or elasticidades_periodo.empty:
         st.warning("No se generaron resultados en elasticidades_periodo. Revisa fechas, SKUs y variación de precios.")
+        return
+
+    if "periodo_tipo" not in elasticidades_periodo.columns:
+        st.warning("La tabla elasticidades_periodo no tiene la columna obligatoria periodo_tipo. Recalcula elasticidades.")
+        return
+
         return
 
     if "periodo_tipo" not in elasticidades_periodo.columns:
@@ -1072,6 +1123,62 @@ def render_elasticity_view() -> None:
             else "Sin confianza"
         )
 
+
+    st.subheader("Filtros")
+    c0, c1, c2, c3 = st.columns(4)
+    with c0:
+        tipo_label = st.selectbox(
+            "Tipo de elasticidad",
+            list(tipo_labels.keys()),
+            index=list(tipo_labels.keys()).index("Trimestral"),
+        )
+
+    selected_periodo_tipo = tipo_labels[tipo_label]
+    filtered_base = df_periodo.copy()
+    if selected_periodo_tipo is not None:
+        filtered_base = filtered_base[filtered_base["periodo_tipo"] == selected_periodo_tipo].copy()
+
+    if filtered_base.empty:
+        st.warning(f"No hay suficientes datos para calcular elasticidad {tipo_label} con los filtros seleccionados.")
+        filtered = filtered_base
+    else:
+        dept_options = ["Todos"] + sorted(filtered_base.get("departamento", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        with c1:
+            dept = st.selectbox("Departamento", dept_options)
+
+        filtered_dept = filtered_base.copy()
+        if dept != "Todos" and "departamento" in filtered_dept.columns:
+            filtered_dept = filtered_dept[filtered_dept["departamento"].astype(str) == str(dept)]
+
+        periodo_options = ["Todos"] + sorted(filtered_dept.get("periodo", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        with c2:
+            periodo = st.selectbox("Periodo", periodo_options)
+
+        filtered_periodo = filtered_dept.copy()
+        if periodo != "Todos" and "periodo" in filtered_periodo.columns:
+            filtered_periodo = filtered_periodo[filtered_periodo["periodo"].astype(str) == str(periodo)]
+
+        sku_options = sorted(filtered_periodo.get("SKU", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        with c3:
+            skus = st.multiselect("SKU", sku_options, default=sku_options[: min(5, len(sku_options))])
+
+        filtered = filtered_periodo.copy()
+        if skus:
+            filtered = filtered[filtered["SKU"].astype(str).isin(skus)]
+
+        if filtered.empty:
+            st.warning(f"No hay suficientes datos para calcular elasticidad {tipo_label} con los filtros seleccionados.")
+
+    if not filtered.empty:
+        st.subheader("KPIs de elasticidades filtradas")
+        elasticidad_prom = pd.to_numeric(filtered.get("elasticidad"), errors="coerce").mean()
+        r2_prom = pd.to_numeric(filtered.get("r2"), errors="coerce").mean()
+        confianza_dom = (
+            filtered["confianza_elasticidad"].dropna().mode().iloc[0]
+            if "confianza_elasticidad" in filtered.columns and not filtered["confianza_elasticidad"].dropna().mode().empty
+            else "Sin confianza"
+        )
+
         k1, k2, k3, k4, k5 = st.columns(5)
         with k1:
             render_kpi_card("Elasticidad promedio", format_num(elasticidad_prom, 3), "Promedio filtrado")
@@ -1355,6 +1462,66 @@ def render_elasticity_view() -> None:
                 st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Mapa geográfico de México")
+        geo = pd.DataFrame()
+        estado_col = "estado"
+
+        filtered_estado_col = next((col for col in ["estado", "state"] if col in filtered.columns), None)
+        ventas_estado_col = (
+            next((col for col in ["estado", "state"] if col in ventas.columns), None)
+            if ventas is not None and not ventas.empty
+            else None
+        )
+
+        if filtered_estado_col is not None and filtered[filtered_estado_col].dropna().any():
+            geo = (
+                filtered.dropna(subset=[filtered_estado_col])
+                .groupby(filtered_estado_col, as_index=False)
+                .agg(elasticidad=("elasticidad", "mean"), SKUs=("SKU", "nunique"))
+                .rename(columns={filtered_estado_col: estado_col})
+            )
+        elif ventas_estado_col is not None:
+            ventas_geo = ventas.copy()
+            if ventas_estado_col != estado_col:
+                ventas_geo[estado_col] = ventas_geo[ventas_estado_col]
+            if 'dept' in locals() and dept != "Todos" and "dept_nm" in ventas_geo.columns:
+                ventas_geo = ventas_geo[ventas_geo["dept_nm"].astype(str) == str(dept)]
+
+            if selected_periodo_tipo == "categoria_departamento":
+                merge_cols_left = [col for col in ["dept_nm", "subdept_nm"] if col in ventas_geo.columns]
+                rename_for_merge = {"departamento": "dept_nm", "categoria": "subdept_nm"}
+                elasticidad_geo = filtered.rename(columns=rename_for_merge).copy()
+                merge_cols = [col for col in merge_cols_left if col in elasticidad_geo.columns]
+                if merge_cols:
+                    elasticidad_geo = elasticidad_geo.groupby(merge_cols, as_index=False).agg(elasticidad=("elasticidad", "mean"))
+                    ventas_geo = ventas_geo.merge(elasticidad_geo, on=merge_cols, how="inner")
+                else:
+                    ventas_geo = ventas_geo.iloc[0:0].copy()
+            else:
+                if 'skus' in locals() and skus and "prod_nbr" in ventas_geo.columns:
+                    ventas_geo = ventas_geo[ventas_geo["prod_nbr"].astype(str).isin(skus)]
+                elasticidad_geo = (
+                    filtered.groupby("SKU", as_index=False)
+                    .agg(elasticidad=("elasticidad", "mean"))
+                    .rename(columns={"SKU": "prod_nbr"})
+                )
+                if "prod_nbr" in ventas_geo.columns:
+                    ventas_geo["prod_nbr"] = ventas_geo["prod_nbr"].astype(str)
+                    elasticidad_geo["prod_nbr"] = elasticidad_geo["prod_nbr"].astype(str)
+                    ventas_geo = ventas_geo.merge(elasticidad_geo, on="prod_nbr", how="inner")
+                else:
+                    ventas_geo = ventas_geo.iloc[0:0].copy()
+
+            if not ventas_geo.empty:
+                geo = (
+                    ventas_geo.dropna(subset=[estado_col])
+                    .groupby(estado_col, as_index=False)
+                    .agg(elasticidad=("elasticidad", "mean"), SKUs=("prod_nbr", "nunique"))
+                )
+
+        if geo.empty:
+            st.info("No hay estados/state disponibles en la base de ventas para construir el mapa con los filtros seleccionados.")
+
+        if not geo.empty:
         estado_col = "estado" if "estado" in filtered.columns else None
         if estado_col is None or filtered[estado_col].dropna().empty:
             st.warning("No hay columna `estado` disponible para construir el mapa en elasticidades_periodo.")
@@ -1368,6 +1535,8 @@ def render_elasticity_view() -> None:
             geo = add_state_coordinates(geo, estado_col=estado_col).dropna(subset=["lat", "lon"])
             if geo.empty:
                 st.warning("No se pudieron homologar los estados a coordenadas de México.")
+
+            if not geo.empty:
             else:
                 fig = px.scatter_geo(
                     geo,
