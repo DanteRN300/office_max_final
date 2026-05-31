@@ -1275,6 +1275,7 @@ def render_elasticity_view() -> None:
         if geo.empty:
             st.info("No hay estados/state disponibles en la base de ventas para construir el mapa con los filtros seleccionados.")
         else:
+            st.dataframe(geo, use_container_width=True)
 
     st.subheader("Filtros")
     c0, c1, c2, c3 = st.columns(4)
