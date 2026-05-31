@@ -328,6 +328,118 @@ def _dependent_selectbox(
         return st.selectbox(label, options, key=key)
 
 
+
+ELASTICITY_EXPECTED_COLUMNS = [
+    "SKU",
+    "categoria",
+    "departamento",
+    "periodo_tipo",
+    "periodo",
+    "fecha_inicio",
+    "fecha_fin",
+    "elasticidad",
+    "r2",
+    "p_value",
+    "num_observaciones",
+    "num_precios_distintos",
+    "precio_promedio",
+    "unidades_promedio",
+    "ingreso_promedio",
+    "margen_promedio",
+    "confianza_elasticidad",
+    "recomendable_elasticidad",
+    "razon_no_recomendable",
+]
+
+ELASTICITY_NUMERIC_COLUMNS = [
+    "elasticidad",
+    "r2",
+    "p_value",
+    "num_observaciones",
+    "num_precios_distintos",
+    "precio_promedio",
+    "unidades_promedio",
+    "ingreso_promedio",
+    "margen_promedio",
+    "descuento_efectivo",
+    "cambio_precio_pct",
+]
+
+ELASTICITY_TEXT_COLUMNS = [
+    "SKU",
+    "categoria",
+    "departamento",
+    "periodo_tipo",
+    "periodo",
+    "confianza_elasticidad",
+    "recomendable_elasticidad",
+    "razon_no_recomendable",
+    "fuente_nse",
+    "categoria_est_socio",
+    "nse_match_status",
+]
+
+
+def _stringify_complex_value(value):
+    """Convierte objetos complejos a texto y conserva nulos para casteos posteriores."""
+    if isinstance(value, (list, tuple, dict, set)):
+        return str(value)
+    return value
+
+
+def prepare_dataframe_for_streamlit(
+    df: pd.DataFrame | None,
+    numeric_columns: list[str] | None = None,
+    text_columns: list[str] | None = None,
+    force_text_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Normaliza tipos para evitar errores PyArrow/Streamlit al mostrar o exportar tablas."""
+    if df is None:
+        return pd.DataFrame()
+
+    clean = df.copy().replace([np.inf, -np.inf], np.nan)
+    numeric_columns = numeric_columns or []
+    text_columns = text_columns or []
+    force_text_columns = force_text_columns or []
+
+    for col in clean.columns:
+        if clean[col].dtype == "object" or str(clean[col].dtype).startswith("category"):
+            clean[col] = clean[col].map(_stringify_complex_value)
+
+    for col in numeric_columns:
+        if col in clean.columns:
+            clean[col] = pd.to_numeric(clean[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    for col in text_columns:
+        if col in clean.columns and col not in numeric_columns:
+            clean[col] = clean[col].fillna("").astype(str)
+
+    for col in force_text_columns:
+        if col in clean.columns:
+            clean[col] = clean[col].fillna("").astype(str)
+
+    for col in clean.columns:
+        if clean[col].dtype == "object" or str(clean[col].dtype).startswith("category"):
+            non_null = clean[col].dropna()
+            if not non_null.empty:
+                clean[col] = clean[col].fillna("").astype(str)
+
+    return clean
+
+
+def prepare_elasticity_dataframe_for_display(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Normaliza elasticidades manteniendo métricas numéricas y textos homogéneos."""
+    return prepare_dataframe_for_streamlit(
+        df,
+        numeric_columns=ELASTICITY_NUMERIC_COLUMNS,
+        text_columns=ELASTICITY_TEXT_COLUMNS,
+    )
+
+
+def _empty_elasticity_periodo_frame() -> pd.DataFrame:
+    """Devuelve una tabla vacía segura con el esquema mínimo esperado."""
+    return pd.DataFrame(columns=ELASTICITY_EXPECTED_COLUMNS)
+
 def _df_to_excel_friendly_csv_bytes(df: pd.DataFrame, sep: str = ";") -> bytes:
     """CSV compatible con Excel en configuración regional de México/España.
 
@@ -1327,7 +1439,10 @@ def render_quality_view() -> None:
         st.dataframe(calidad_varianza, use_container_width=True)
 
     with st.expander("Diagnóstico de calidad consolidado"):
-        st.dataframe(diagnostico_calidad, use_container_width=True)
+        st.dataframe(
+            prepare_dataframe_for_streamlit(diagnostico_calidad, force_text_columns=["valor"]),
+            use_container_width=True,
+        )
 
     st.subheader("Comportamiento histórico de ventas con Machine Learning")
     st.markdown(
@@ -1403,14 +1518,34 @@ def render_elasticity_view() -> None:
 
     if elasticidades_periodo is None or elasticidades_periodo.empty:
         st.warning("No se generaron resultados en elasticidades_periodo. Revisa fechas, SKUs y variación de precios.")
-        return
+        df_periodo = _empty_elasticity_periodo_frame()
+    else:
+        df_periodo = prepare_elasticity_dataframe_for_display(elasticidades_periodo)
 
-    if "periodo_tipo" not in elasticidades_periodo.columns:
+    if "periodo_tipo" not in df_periodo.columns:
         st.warning("La tabla elasticidades_periodo no tiene la columna obligatoria periodo_tipo. Recalcula elasticidades.")
+        df_periodo = _empty_elasticity_periodo_frame()
+
+    for col in ELASTICITY_EXPECTED_COLUMNS:
+        if col not in df_periodo.columns:
+            df_periodo[col] = np.nan
+
+    df_periodo = prepare_elasticity_dataframe_for_display(df_periodo)
+    if "periodo_tipo" in df_periodo.columns:
+        df_periodo["periodo_tipo"] = df_periodo["periodo_tipo"].astype(str).str.strip()
+        df_periodo = df_periodo[df_periodo["periodo_tipo"] != ""].copy()
+
+    if df_periodo.empty:
+        st.warning("No hay elasticidades_periodo válidas para mostrar o descargar.")
         return
 
-    df_periodo = elasticidades_periodo.copy().replace([np.inf, -np.inf], np.nan)
-    df_periodo["periodo_tipo"] = df_periodo["periodo_tipo"].astype(str)
+    if "elasticidad" not in df_periodo.columns:
+        st.warning("La tabla elasticidades_periodo no tiene la columna elasticidad; se mostrará sin métricas numéricas.")
+        df_periodo["elasticidad"] = np.nan
+    else:
+        df_periodo["elasticidad"] = pd.to_numeric(df_periodo["elasticidad"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if df_periodo["elasticidad"].isna().all():
+            st.warning("La columna elasticidad no contiene valores numéricos válidos con los filtros actuales.")
 
     tipo_labels = {
         "Todos": None,
@@ -1483,14 +1618,17 @@ def render_elasticity_view() -> None:
         )
     )
 
-    st.dataframe(resumen, use_container_width=True, hide_index=True)
-
-    recomendables = (
-        df_periodo
-        .get("recomendable_elasticidad", pd.Series(False, index=df_periodo.index))
-        .fillna(False)
-        .astype(bool)
+    st.dataframe(
+        prepare_dataframe_for_streamlit(resumen),
+        use_container_width=True,
+        hide_index=True,
     )
+
+    recomendables_raw = df_periodo.get("recomendable_elasticidad", pd.Series(False, index=df_periodo.index))
+    if recomendables_raw.dtype == "object" or str(recomendables_raw.dtype).startswith("string"):
+        recomendables = recomendables_raw.fillna("").astype(str).str.strip().str.lower().isin(["true", "1", "sí", "si", "yes"])
+    else:
+        recomendables = recomendables_raw.fillna(False).astype(bool)
 
     m1, m2, m3, m4, m5 = st.columns(5)
 
@@ -1525,7 +1663,7 @@ def render_elasticity_view() -> None:
             "Tipo de elasticidad",
             list(tipo_labels.keys()),
             index=list(tipo_labels.keys()).index("Trimestral"),
-            key="elasticidad_tipo_label",
+            key="elasticity_tipo_selectbox",
         )
 
     selected_periodo_tipo = tipo_labels[tipo_label]
@@ -1560,7 +1698,7 @@ def render_elasticity_view() -> None:
             dept = st.selectbox(
                 "Departamento",
                 dept_options,
-                key="elasticidad_departamento",
+                key="elasticity_departamento_selectbox",
             )
 
         filtered_dept = filtered_base.copy()
@@ -1583,7 +1721,7 @@ def render_elasticity_view() -> None:
             periodo = st.selectbox(
                 "Periodo",
                 periodo_options,
-                key="elasticidad_periodo",
+                key="elasticity_periodo_selectbox",
             )
 
         filtered_periodo = filtered_dept.copy()
@@ -1607,7 +1745,7 @@ def render_elasticity_view() -> None:
                 "SKU",
                 sku_options,
                 default=sku_options[: min(5, len(sku_options))],
-                key="elasticidad_skus",
+                key="elasticity_sku_multiselect",
             )
 
         filtered = filtered_periodo.copy()
@@ -1684,7 +1822,7 @@ def render_elasticity_view() -> None:
 
         st.subheader("Tabla de elasticidades")
 
-        filtered_display = build_elasticity_download(filtered)
+        filtered_display = prepare_elasticity_dataframe_for_display(build_elasticity_download(filtered))
 
         st.dataframe(
             filtered_display,
@@ -1877,11 +2015,18 @@ def render_elasticity_view() -> None:
             geo = add_state_coordinates(
                 geo,
                 estado_col=estado_col,
-            ).dropna(subset=["lat", "lon"])
+            )
+            geo["lat"] = pd.to_numeric(geo.get("lat"), errors="coerce")
+            geo["lon"] = pd.to_numeric(geo.get("lon"), errors="coerce")
+            geo["marker_size"] = pd.to_numeric(geo["Elasticidad absoluta"], errors="coerce")
+            geo["marker_size"] = geo["marker_size"].replace([np.inf, -np.inf], np.nan)
+            geo["marker_size"] = geo["marker_size"].fillna(1).clip(lower=1)
+            geo = geo.dropna(subset=["lat", "lon", "marker_size"])
+            geo = geo[geo["marker_size"] >= 0].copy()
 
             if geo.empty:
                 st.warning(
-                    "No se pudieron homologar los estados a coordenadas de México."
+                    "No hay datos geográficos válidos para mostrar el mapa."
                 )
 
             else:
@@ -1890,7 +2035,7 @@ def render_elasticity_view() -> None:
                     lat="lat",
                     lon="lon",
                     color="Elasticidad absoluta",
-                    size="Elasticidad absoluta",
+                    size="marker_size",
                     hover_name=estado_col,
                     hover_data={
                         "elasticidad": ":.3f",
@@ -1914,8 +2059,8 @@ def render_elasticity_view() -> None:
 
     st.subheader("Descarga")
 
-    all_csv = build_elasticity_download(df_periodo)
-    filtered_csv = build_elasticity_download(filtered)
+    all_csv = prepare_elasticity_dataframe_for_display(build_elasticity_download(df_periodo))
+    filtered_csv = prepare_elasticity_dataframe_for_display(build_elasticity_download(filtered))
 
     if all_csv.empty:
         st.warning("No hay elasticidades disponibles para descargar.")
@@ -1926,10 +2071,10 @@ def render_elasticity_view() -> None:
         with d1:
             st.download_button(
                 "Descargar todas las elasticidades",
-                data=convert_df_to_csv(all_csv),
+                data=_df_to_excel_friendly_csv_bytes(all_csv, sep=";"),
                 file_name="elasticidades_periodo.csv",
-                mime="text/csv",
-                key="download_elasticidades_todas",
+                mime="text/csv; charset=utf-8",
+                key="elasticity_download_all_button",
             )
 
         with d2:
@@ -1939,10 +2084,10 @@ def render_elasticity_view() -> None:
             else:
                 st.download_button(
                     "Descargar elasticidades filtradas",
-                    data=convert_df_to_csv(filtered_csv),
+                    data=_df_to_excel_friendly_csv_bytes(filtered_csv, sep=";"),
                     file_name=filename_by_tipo[tipo_label],
-                    mime="text/csv",
-                    key="download_elasticidades_filtradas",
+                    mime="text/csv; charset=utf-8",
+                    key="elasticity_download_filtered_button",
                 )
 
 
