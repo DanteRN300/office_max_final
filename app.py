@@ -1060,8 +1060,8 @@ def render_future_pricing_view() -> None:
     st.subheader("Tabla interna: pricing_futuro_escenarios")
     table_cols = [
         "SKU", "categoria", "departamento", "horizonte", "metodo_proyeccion",
-        "tipo_elasticidad_usada", "nombre_escenario", "precio_actual", "precio_lista",
-        "precio_efectivo", "descuento_efectivo", "cambio_precio_pct", "demanda_base",
+        "tipo_elasticidad_usada", "tipo_escenario", "nombre_escenario", "precio_actual", "precio_lista",
+        "precio_efectivo", "descuento_efectivo", "cambio_precio_pct", "riesgo_promocion", "demanda_base",
         "unidades_simuladas", "ingreso_base", "ingreso_simulado", "margen_base",
         "margen_simulado", "variacion_unidades", "variacion_ingreso", "variacion_margen",
         "elasticidad_usada", "confianza_elasticidad", "confianza_demanda", "confianza_final",
@@ -1195,8 +1195,8 @@ def render_historical_pricing_view() -> None:
     st.subheader("Tabla interna: pricing_historico_escenarios")
     table_cols = [
         "SKU", "categoria", "departamento", "periodo_tipo", "periodo",
-        "tipo_elasticidad_usada", "nombre_escenario", "precio_real", "precio_lista",
-        "precio_efectivo", "descuento_efectivo", "cambio_precio_pct",
+        "tipo_elasticidad_usada", "tipo_escenario", "nombre_escenario", "precio_real", "precio_lista",
+        "precio_efectivo", "descuento_efectivo", "cambio_precio_pct", "riesgo_promocion",
         "unidades_reales", "unidades_simuladas", "ingreso_real", "ingreso_simulado",
         "margen_real", "margen_simulado", "variacion_unidades", "variacion_ingreso",
         "variacion_margen", "recomendacion_historica", "confianza", "razon_recomendacion",

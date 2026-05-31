@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .config import ELASTICIDAD_CAP_MAX, ELASTICIDAD_CAP_MIN
+from .promotions import escenarios_con_promociones, evaluar_riesgo_promocion, es_promocion
 from .utils import build_quarter_label, parse_transaction_dates
 
 PERIODOS_HISTORICOS = ["mensual", "trimestral", "semestral", "anual"]
@@ -31,6 +32,7 @@ ESCENARIOS_HISTORICOS = pd.DataFrame(
     columns=["escenario_id", "nombre_escenario", "cambio_precio_pct"],
 )
 ESCENARIOS_HISTORICOS["tipo_escenario"] = "cambio_precio_simple"
+ESCENARIOS_HISTORICOS = escenarios_con_promociones(ESCENARIOS_HISTORICOS)
 
 PRICING_HISTORICO_ESCENARIOS_COLUMNS = [
     "SKU",
@@ -49,6 +51,7 @@ PRICING_HISTORICO_ESCENARIOS_COLUMNS = [
     "precio_efectivo",
     "descuento_efectivo",
     "cambio_precio_pct",
+    "riesgo_promocion",
     "unidades_reales",
     "unidades_simuladas",
     "ingreso_real",
@@ -218,12 +221,13 @@ def _prepare_historical_financial_base(ventas: pd.DataFrame, periodo_tipo: str) 
             precio_lista=("_precio_lista_linea", "max"),
             costo_total=("_costo_total", "sum"),
             margen_real=("_margen_linea", "sum"),
+            costo_observaciones=("_costo_unitario", "count"),
         )
         .reset_index()
     )
     agg["precio_real"] = agg["ingreso_real"] / agg["unidades_reales"]
     agg["precio_lista"] = agg["precio_lista"].fillna(agg["precio_real"])
-    agg["costo_unitario"] = agg["costo_total"] / agg["unidades_reales"]
+    agg["costo_unitario"] = np.where(agg["costo_observaciones"].gt(0), agg["costo_total"] / agg["unidades_reales"], np.nan)
 
     for source_col, target_col in [("subdept_nm", "categoria"), ("categoria", "categoria"), ("dept_nm", "departamento"), ("departamento", "departamento")]:
         if source_col in df.columns and target_col not in agg.columns:
@@ -306,9 +310,13 @@ def _build_elasticity_candidates(base: pd.DataFrame, elasticidades_periodo: pd.D
 
 def _recommendation_reason(row: pd.Series) -> tuple[str, str]:
     confianza = row.get("confianza")
+    if es_promocion(row.get("tipo_escenario")) and row.get("riesgo_promocion") == "Alto":
+        return "No recomendar", "Promoción riesgosa: elasticidad, demanda base, costo o margen no cumplen los guardrails."
     if pd.isna(row.get("elasticidad_usada")) or str(confianza).lower() in {"no usable", "no recomendable", "baja"}:
         return "No recomendar", "Elasticidad insuficiente o de baja confianza para recomendar este escenario."
     if bool(row.get("mejor_escenario_historico", False)):
+        if pd.isna(row.get("margen_simulado", np.nan)):
+            return "Mejor escenario histórico", "Maximiza ingreso simulado. No se cuenta con costo unitario, por lo que la recomendación se basa en ingreso y no en margen."
         return "Mejor escenario histórico", "Maximiza margen simulado dentro del backtesting del mismo SKU, periodo y tipo de elasticidad."
     if row.get("variacion_margen", 0) > 0 and row.get("variacion_ingreso", 0) >= 0:
         return "Escenario viable", "Mejora margen sin deteriorar ingreso frente al periodo real observado."
@@ -356,20 +364,48 @@ def build_pricing_historico_escenarios(
     margen_real = pd.to_numeric(sim["margen_real"], errors="coerce")
     costo_unitario = pd.to_numeric(sim["costo_unitario"], errors="coerce")
 
-    valid = elasticidad.notna() & precio_real.gt(0) & unidades_reales.gt(0) & (1 + cambio).gt(0)
-    sim["precio_efectivo"] = np.where(valid, precio_real * (1 + cambio), np.nan)
-    sim["descuento_efectivo"] = np.where(precio_lista.gt(0), 1 - (sim["precio_efectivo"] / precio_lista), np.nan)
-    sim["unidades_simuladas"] = np.where(valid, unidades_reales * np.exp(elasticidad * np.log1p(cambio)), np.nan)
+    promo = es_promocion(sim["tipo_escenario"])
+    factor_precio = pd.to_numeric(sim.get("factor_precio", 1 + cambio), errors="coerce").fillna(1 + cambio)
+    valid = elasticidad.notna() & precio_real.gt(0) & unidades_reales.gt(0) & factor_precio.gt(0)
+    sim["precio_efectivo"] = np.where(valid, precio_real * factor_precio, np.nan)
+    sim["descuento_efectivo"] = np.where(
+        promo,
+        pd.to_numeric(sim.get("descuento_efectivo"), errors="coerce"),
+        np.where(precio_lista.gt(0), 1 - (sim["precio_efectivo"] / precio_lista), np.nan),
+    )
+    cambio_unidades_pct = elasticidad * cambio
+    sim["unidades_simuladas"] = np.where(
+        valid & promo,
+        unidades_reales * (1 + cambio_unidades_pct),
+        np.where(valid, unidades_reales * np.exp(elasticidad * np.log1p(cambio)), np.nan),
+    )
+    sim["unidades_simuladas"] = pd.to_numeric(sim["unidades_simuladas"], errors="coerce").clip(lower=0)
     sim["ingreso_simulado"] = sim["precio_efectivo"] * sim["unidades_simuladas"]
-    sim["margen_simulado"] = (sim["precio_efectivo"] - costo_unitario) * sim["unidades_simuladas"]
+    sim["margen_simulado"] = np.where(
+        costo_unitario.notna(),
+        (sim["precio_efectivo"] - costo_unitario) * sim["unidades_simuladas"],
+        np.nan,
+    )
 
     sim["variacion_unidades"] = sim["unidades_simuladas"] - unidades_reales
     sim["variacion_ingreso"] = sim["ingreso_simulado"] - ingreso_real
     sim["variacion_margen"] = sim["margen_simulado"] - margen_real
+    sim["riesgo_promocion"] = evaluar_riesgo_promocion(
+        sim["tipo_escenario"],
+        elasticidad,
+        unidades_reales,
+        costo_unitario,
+        sim["precio_efectivo"],
+        sim["margen_simulado"],
+        confianza_elasticidad=sim.get("confianza"),
+    )
 
     group_cols = ["SKU", "periodo_tipo", "periodo", "tipo_elasticidad_usada"]
     sim["mejor_escenario_historico"] = False
-    valid_best = sim.dropna(subset=["margen_simulado", "ingreso_simulado", "unidades_simuladas"])
+    valid_best = sim.dropna(subset=["ingreso_simulado", "unidades_simuladas"])
+    valid_best = valid_best[~(es_promocion(valid_best["tipo_escenario"]) & valid_best["riesgo_promocion"].eq("Alto"))].copy()
+    if valid_best["margen_simulado"].notna().any():
+        valid_best = valid_best[valid_best["margen_simulado"].notna()].copy()
     if not valid_best.empty:
         best_idx = (
             valid_best.sort_values(

@@ -73,7 +73,7 @@ def test_build_pricing_futuro_escenarios_uses_future_demand_and_existing_elastic
 
     assert list(out.columns) == PRICING_FUTURO_ESCENARIOS_COLUMNS
     assert set(out["horizonte"]) == {"1 mes", "3 meses"}
-    assert len(out) == 18
+    assert len(out) == 24
     assert not np.isinf(out.select_dtypes(include="number")).any().any()
     assert not out.isna().any().any()
 
@@ -114,3 +114,31 @@ def test_build_pricing_futuro_escenarios_marks_low_confidence_suspicious_scenari
     changed = out[out["cambio_precio_pct"].ne(0)]
     assert changed["riesgo"].eq("Alto").all()
     assert changed["recomendacion"].eq("No recomendar").all()
+
+
+def test_build_pricing_futuro_escenarios_calculates_promotions_and_blocks_dangerous_margin():
+    demanda = pd.DataFrame([{"SKU": "SKU1", "categoria": "Cuadernos", "departamento": "Papelería", "horizonte": "1 mes", "metodo_proyeccion": "Automático recomendado", "fecha_inicio_proyeccion": "2025-01-01", "fecha_fin_proyeccion": "2025-01-31", "demanda_base": 100, "confianza_demanda": "Alta"}])
+    elasticidades = pd.DataFrame([{"SKU": "SKU1", "categoria": "Cuadernos", "departamento": "Papelería", "periodo_tipo": "global_sku", "periodo": "global_sku", "elasticidad": -1.0, "confianza_elasticidad": "Alta"}])
+    precios = pd.DataFrame([{"SKU": "SKU1", "precio_actual": 10, "precio_lista": 10, "costo_unitario": 6}])
+
+    out = build_pricing_futuro_escenarios(demanda, elasticidades, precios)
+
+    promo_2x1 = out[out["tipo_escenario"].eq("promocion_2x1")].iloc[0]
+    assert promo_2x1["precio_efectivo"] == 5
+    assert promo_2x1["descuento_efectivo"] == 50
+    assert promo_2x1["cambio_precio_pct"] == -50
+    assert promo_2x1["unidades_simuladas"] == 150
+    assert promo_2x1["ingreso_simulado"] == 750
+    assert promo_2x1["margen_simulado"] == -150
+    assert promo_2x1["riesgo_promocion"] == "Alto"
+    assert promo_2x1["recomendacion"] == "No recomendar"
+
+    promo_3x2 = out[out["tipo_escenario"].eq("promocion_3x2")].iloc[0]
+    assert round(promo_3x2["precio_efectivo"], 4) == 6.6667
+    assert round(promo_3x2["descuento_efectivo"], 2) == 33.33
+    assert round(promo_3x2["unidades_simuladas"], 2) == 133.33
+
+    promo_segundo_50 = out[out["tipo_escenario"].eq("promocion_segundo_50")].iloc[0]
+    assert promo_segundo_50["precio_efectivo"] == 7.5
+    assert promo_segundo_50["descuento_efectivo"] == 25
+    assert promo_segundo_50["unidades_simuladas"] == 125
