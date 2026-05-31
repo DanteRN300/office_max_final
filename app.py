@@ -12,6 +12,7 @@ Versión optimizada:
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -640,12 +641,13 @@ def ensure_elasticity_ready(show_button: bool = True) -> bool:
             st.session_state.get("sales_signature"),
             st.session_state.get("nse_signature"),
             st.session_state.get("promo_signature"),
+            "elasticidades_periodo_v2_all_periodos",
         )
         cache = st.session_state.manual_cache.setdefault("elasticity", {})
         if cache_key in cache:
             elasticidad, ventas_base_elasticidad, bloques = cache[cache_key]
         else:
-            with st.spinner("Calculando elasticidad SKU × trimestre usando base cruzada con NSE..."):
+            with st.spinner("Calculando elasticidades multi-periodo usando base cruzada con NSE..."):
                 elasticidad, ventas_base_elasticidad, bloques = calculate_elasticity_cached(
                     st.session_state.ventas_nse,
                     st.session_state.promo_df,
@@ -655,10 +657,18 @@ def ensure_elasticity_ready(show_button: bool = True) -> bool:
 
         st.session_state.elasticity_cache_key = cache_key
         st.session_state.elasticidad = elasticidad
-        st.session_state.elasticidades_periodo = elasticidad.attrs.get(
+        elasticidades_periodo = elasticidad.attrs.get(
             "elasticidades_periodo",
             ventas_base_elasticidad.attrs.get("elasticidades_periodo", pd.DataFrame()),
         )
+        if (elasticidades_periodo is None or elasticidades_periodo.empty or "periodo_tipo" not in elasticidades_periodo.columns):
+            from modules.elasticity import calculate_elasticidades_periodo
+
+            elasticidades_periodo = calculate_elasticidades_periodo(
+                st.session_state.ventas_nse,
+                st.session_state.promo_df,
+            )
+        st.session_state.elasticidades_periodo = elasticidades_periodo
         st.session_state.ventas_base_elasticidad = ventas_base_elasticidad
         st.session_state.bloques = bloques
         st.session_state.elasticity_ready = True
@@ -894,9 +904,9 @@ def render_quality_view() -> None:
 
 
 def render_elasticity_view() -> None:
-    """Vista 2: elasticidad."""
+    """Vista 2: elasticidad multi-periodo."""
     st.title("2. Elasticidad")
-    st.caption("Elasticidad log-log por SKU y bloques fijos de 3 meses.")
+    st.caption("Elasticidad log-log multi-periodo calculada desde elasticidades_periodo.")
 
     if not require_processed():
         return
@@ -906,15 +916,56 @@ def render_elasticity_view() -> None:
 
     import plotly.express as px
 
-    from modules.elasticity import build_dynamic_explanation_elasticity, build_elasticity_download
+    from modules.elasticity import PERIODOS_ELASTICIDAD, build_elasticity_download
     from modules.utils import add_state_coordinates
 
-    df = st.session_state.elasticidad
+    elasticidades_periodo = st.session_state.get("elasticidades_periodo", pd.DataFrame())
+    legacy_df = st.session_state.get("elasticidad", pd.DataFrame())
     ventas = st.session_state.ventas_base_elasticidad
 
-    if df.empty:
-        st.warning("No se generaron resultados de elasticidad. Revisa fechas, SKUs y variación de precios.")
+    if (elasticidades_periodo is None or elasticidades_periodo.empty) and legacy_df is not None and not legacy_df.empty:
+        elasticidades_periodo = legacy_df.attrs.get(
+            "elasticidades_periodo",
+            st.session_state.ventas_base_elasticidad.attrs.get("elasticidades_periodo", pd.DataFrame()),
+        )
+
+    if elasticidades_periodo is None or elasticidades_periodo.empty:
+        st.warning("No se generaron resultados en elasticidades_periodo. Revisa fechas, SKUs y variación de precios.")
         return
+
+    if "periodo_tipo" not in elasticidades_periodo.columns:
+        st.warning("La tabla elasticidades_periodo no tiene la columna obligatoria periodo_tipo. Recalcula elasticidades.")
+        return
+
+    df_periodo = elasticidades_periodo.copy().replace([np.inf, -np.inf], np.nan)
+    df_periodo["periodo_tipo"] = df_periodo["periodo_tipo"].astype(str)
+
+    tipo_labels = {
+        "Todos": None,
+        "Mensual": "mensual",
+        "Trimestral": "trimestral",
+        "Semestral": "semestral",
+        "Anual": "anual",
+        "Global SKU": "global_sku",
+        "Categoría/Departamento": "categoria_departamento",
+    }
+    filename_by_tipo = {
+        "Todos": "elasticidades_filtradas.csv",
+        "Mensual": "elasticidades_mensual.csv",
+        "Trimestral": "elasticidades_trimestral.csv",
+        "Semestral": "elasticidades_semestral.csv",
+        "Anual": "elasticidades_anual.csv",
+        "Global SKU": "elasticidades_global_sku.csv",
+        "Categoría/Departamento": "elasticidades_categoria_departamento.csv",
+    }
+    label_by_periodo = {v: k for k, v in tipo_labels.items() if v is not None}
+
+    missing_periods = [p for p in PERIODOS_ELASTICIDAD if p not in set(df_periodo["periodo_tipo"].dropna().astype(str))]
+    for periodo_tipo in missing_periods:
+        st.warning(
+            f"No hay suficientes datos para calcular elasticidad {label_by_periodo.get(periodo_tipo, periodo_tipo)} "
+            "con los filtros seleccionados."
+        )
 
     with st.expander("Cómo interpretar este dashboard", expanded=True):
         st.markdown(
@@ -923,129 +974,192 @@ def render_elasticity_view() -> None:
             Una elasticidad entre **0 y -1** indica demanda inelástica: puede tolerar incrementos.
             Una elasticidad **menor a -1** indica demanda elástica: conviene tener cuidado con subidas y evaluar promociones.
             Una elasticidad **positiva** es sospechosa o requiere revisión, porque sugiere que precio y demanda suben juntos.
-            Un **R² bajo** o **p-value alto** no invalida automáticamente el resultado, pero sí aumenta el riesgo de interpretación.
+            La columna **periodo_tipo** identifica si el registro es mensual, trimestral, semestral, anual, global SKU o categoría/departamento.
             """
         )
 
-    st.subheader("Filtros")
-    c1, c2, c3 = st.columns(3)
-
-    dept_options = ["Todos"] + sorted(df["dept_nm"].dropna().astype(str).unique().tolist()) if "dept_nm" in df.columns else ["Todos"]
-    with c1:
-        dept = st.selectbox("Departamento", dept_options)
-
-    df_dep = filter_dataframe_dependently(df, {"dept_nm": dept})
-
-    tri_options = ["Todos"] + sorted(df_dep["trimestre"].dropna().astype(str).unique().tolist())
-    with c2:
-        trimestre = st.selectbox("Trimestre", tri_options)
-
-    df_dep_tri = filter_dataframe_dependently(df_dep, {"trimestre": trimestre})
-
-    sku_options = sorted(df_dep_tri["SKU"].dropna().astype(str).unique().tolist())
-    with c3:
-        skus = st.multiselect("SKU", sku_options, default=sku_options[: min(5, len(sku_options))])
-
-    filtered = filter_dataframe_dependently(df_dep_tri, {"SKU": skus})
-
-    if filtered.empty:
-        st.warning("No hay datos para la selección actual.")
-        return
-
-    st.subheader("KPIs")
-    elasticidad_prom = filtered["Elasticidad"].mean()
-    beta_prom = filtered["Beta"].mean()
-    r2_prom = filtered["R2"].mean()
-    diagnostico_dom = (
-        filtered["Diagnostico"].dropna().mode().iloc[0]
-        if not filtered["Diagnostico"].dropna().mode().empty
-        else "Sin diagnóstico"
+    st.subheader("Resumen de disponibilidad")
+    resumen = (
+        df_periodo.groupby("periodo_tipo", dropna=False)
+        .agg(
+            registros=("periodo_tipo", "size"),
+            skus_unicos=("SKU", "nunique"),
+            alta=("confianza_elasticidad", lambda s: (s == "Alta").sum()),
+            media=("confianza_elasticidad", lambda s: (s == "Media").sum()),
+            baja=("confianza_elasticidad", lambda s: (s == "Baja").sum()),
+            no_usable=("confianza_elasticidad", lambda s: (s == "No usable").sum()),
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "periodo_tipo": "periodo_tipo",
+                "registros": "número de registros",
+                "skus_unicos": "número de SKUs únicos",
+                "alta": "confianza Alta",
+                "media": "confianza Media",
+                "baja": "confianza Baja",
+                "no_usable": "No usable",
+            }
+        )
     )
+    st.dataframe(resumen, use_container_width=True, hide_index=True)
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    with k1:
-        render_kpi_card("Elasticidad promedio", format_num(elasticidad_prom, 3), "Promedio filtrado")
-    with k2:
-        render_kpi_card("Beta promedio", format_num(beta_prom, 3), "Modelo log-log")
-    with k3:
-        render_kpi_card("R² promedio", format_num(r2_prom, 3), "Ajuste promedio")
-    with k4:
-        render_kpi_card("SKUs analizados", f"{filtered['SKU'].nunique():,}", "Únicos")
-    with k5:
-        render_kpi_card("Diagnóstico dominante", diagnostico_dom, "Moda")
+    recomendables = df_periodo.get("recomendable_elasticidad", pd.Series(False, index=df_periodo.index)).fillna(False).astype(bool)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1:
+        render_kpi_card("Total registros", f"{len(df_periodo):,}", "elasticidades_periodo")
+    with m2:
+        render_kpi_card("Tipos incluidos", f"{df_periodo['periodo_tipo'].nunique():,}", ", ".join(sorted(df_periodo["periodo_tipo"].unique())))
+    with m3:
+        render_kpi_card("SKUs únicos", f"{df_periodo['SKU'].nunique():,}", "Incluye grupos categoría/depto")
+    with m4:
+        render_kpi_card("Recomendables", f"{int(recomendables.sum()):,}", "confianza Media/Alta")
+    with m5:
+        render_kpi_card("No recomendables", f"{int((~recomendables).sum()):,}", "Baja o No usable")
 
-    st.subheader("Curva de elasticidad")
-    curva_df = filtered.dropna(subset=["Alfa", "Elasticidad"]).copy()
-    if curva_df.empty or ventas.empty:
-        st.warning("No hay alfa/elasticidad suficiente para construir la curva.")
-    else:
-        curva_plot = build_elasticity_curve_data(
-            curva_df,
-            float(ventas["precio_unitario"].quantile(0.05)),
-            float(ventas["precio_unitario"].quantile(0.95)),
-            MAX_SKUS_CURVA_ELASTICIDAD,
+    st.subheader("Filtros")
+    c0, c1, c2, c3 = st.columns(4)
+    with c0:
+        tipo_label = st.selectbox(
+            "Tipo de elasticidad",
+            list(tipo_labels.keys()),
+            index=list(tipo_labels.keys()).index("Trimestral"),
         )
-        if not curva_plot.empty:
-            fig = px.line(curva_plot, x="Demanda estimada", y="Precio", color="SKU", title="Curva de elasticidad estimada")
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption(build_dynamic_explanation_elasticity(filtered, {"departamento": dept, "trimestre": trimestre, "SKU": ", ".join(skus[:5])}))
 
-    st.subheader("Serie de tiempo de demanda")
-    ventas_f = ventas
-    if dept != "Todos" and "dept_nm" in ventas_f.columns:
-        ventas_f = ventas_f[ventas_f["dept_nm"].astype(str) == str(dept)]
-    if skus:
-        ventas_f = ventas_f[ventas_f["prod_nbr"].astype(str).isin(skus)]
+    selected_periodo_tipo = tipo_labels[tipo_label]
+    filtered_base = df_periodo.copy()
+    if selected_periodo_tipo is not None:
+        filtered_base = filtered_base[filtered_base["periodo_tipo"] == selected_periodo_tipo].copy()
 
-    if ventas_f.empty:
-        st.warning("No hay ventas para la serie de tiempo con estos filtros.")
+    if filtered_base.empty:
+        st.warning(f"No hay suficientes datos para calcular elasticidad {tipo_label} con los filtros seleccionados.")
+        filtered = filtered_base
     else:
-        serie = aggregate_weekly_demand(ventas_f)
-        if "Promoción" in serie.columns:
-            fig = px.line(serie, x="tran_date", y="Demanda", color="Promoción", title="Demanda semanal con/sin promoción")
-        else:
-            fig = px.line(serie, x="tran_date", y="Demanda", title="Demanda semanal")
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(build_dynamic_explanation_elasticity(filtered, {"departamento": dept, "trimestre": trimestre}))
+        dept_options = ["Todos"] + sorted(filtered_base.get("departamento", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        with c1:
+            dept = st.selectbox("Departamento", dept_options)
 
-    st.subheader("Mapa geográfico de México")
-    estado_col = "estado" if "estado" in filtered.columns else None
-    if estado_col is None or filtered[estado_col].dropna().empty:
-        st.warning("No hay columna `estado` disponible para construir el mapa.")
-    else:
-        geo = (
-            filtered.dropna(subset=[estado_col])
-            .groupby(estado_col, as_index=False)
-            .agg(Elasticidad=("Elasticidad", "mean"), SKUs=("SKU", "nunique"))
+        filtered_dept = filtered_base.copy()
+        if dept != "Todos" and "departamento" in filtered_dept.columns:
+            filtered_dept = filtered_dept[filtered_dept["departamento"].astype(str) == str(dept)]
+
+        periodo_options = ["Todos"] + sorted(filtered_dept.get("periodo", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        with c2:
+            periodo = st.selectbox("Periodo", periodo_options)
+
+        filtered_periodo = filtered_dept.copy()
+        if periodo != "Todos" and "periodo" in filtered_periodo.columns:
+            filtered_periodo = filtered_periodo[filtered_periodo["periodo"].astype(str) == str(periodo)]
+
+        sku_options = sorted(filtered_periodo.get("SKU", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        with c3:
+            skus = st.multiselect("SKU", sku_options, default=sku_options[: min(5, len(sku_options))])
+
+        filtered = filtered_periodo.copy()
+        if skus:
+            filtered = filtered[filtered["SKU"].astype(str).isin(skus)]
+
+        if filtered.empty:
+            st.warning(f"No hay suficientes datos para calcular elasticidad {tipo_label} con los filtros seleccionados.")
+
+    if not filtered.empty:
+        st.subheader("KPIs de elasticidades filtradas")
+        elasticidad_prom = pd.to_numeric(filtered.get("elasticidad"), errors="coerce").mean()
+        r2_prom = pd.to_numeric(filtered.get("r2"), errors="coerce").mean()
+        confianza_dom = (
+            filtered["confianza_elasticidad"].dropna().mode().iloc[0]
+            if "confianza_elasticidad" in filtered.columns and not filtered["confianza_elasticidad"].dropna().mode().empty
+            else "Sin confianza"
         )
-        geo["Elasticidad absoluta"] = geo["Elasticidad"].abs()
-        geo = add_state_coordinates(geo, estado_col=estado_col).dropna(subset=["lat", "lon"])
-        if geo.empty:
-            st.warning("No se pudieron homologar los estados a coordenadas de México.")
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1:
+            render_kpi_card("Elasticidad promedio", format_num(elasticidad_prom, 3), "Promedio filtrado")
+        with k2:
+            render_kpi_card("R² promedio", format_num(r2_prom, 3), "Ajuste promedio")
+        with k3:
+            render_kpi_card("SKUs analizados", f"{filtered['SKU'].nunique():,}", "Únicos")
+        with k4:
+            render_kpi_card("Registros", f"{len(filtered):,}", tipo_label)
+        with k5:
+            render_kpi_card("Confianza dominante", confianza_dom, "Moda")
+
+        st.subheader("Tabla de elasticidades")
+        filtered_display = build_elasticity_download(filtered)
+        st.dataframe(filtered_display, use_container_width=True, hide_index=True)
+
+        st.subheader("Serie de tiempo de demanda")
+        ventas_f = ventas
+        if ventas_f is None or ventas_f.empty:
+            st.warning("No hay ventas para la serie de tiempo con estos filtros.")
         else:
-            fig = px.scatter_geo(
-                geo,
-                lat="lat",
-                lon="lon",
-                color="Elasticidad absoluta",
-                size="Elasticidad absoluta",
-                hover_name=estado_col,
-                hover_data={"Elasticidad": ":.3f", "SKUs": True, "lat": False, "lon": False},
-                scope="north america",
-                title="Intensidad de elasticidad absoluta por estado",
+            if 'dept' in locals() and dept != "Todos" and "dept_nm" in ventas_f.columns:
+                ventas_f = ventas_f[ventas_f["dept_nm"].astype(str) == str(dept)]
+            if 'skus' in locals() and skus and selected_periodo_tipo != "categoria_departamento":
+                ventas_f = ventas_f[ventas_f["prod_nbr"].astype(str).isin(skus)]
+            if ventas_f.empty:
+                st.warning("No hay ventas para la serie de tiempo con estos filtros.")
+            else:
+                serie = aggregate_weekly_demand(ventas_f)
+                if "Promoción" in serie.columns:
+                    fig = px.line(serie, x="tran_date", y="Demanda", color="Promoción", title="Demanda semanal con/sin promoción")
+                else:
+                    fig = px.line(serie, x="tran_date", y="Demanda", title="Demanda semanal")
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Mapa geográfico de México")
+        estado_col = "estado" if "estado" in filtered.columns else None
+        if estado_col is None or filtered[estado_col].dropna().empty:
+            st.warning("No hay columna `estado` disponible para construir el mapa en elasticidades_periodo.")
+        else:
+            geo = (
+                filtered.dropna(subset=[estado_col])
+                .groupby(estado_col, as_index=False)
+                .agg(elasticidad=("elasticidad", "mean"), SKUs=("SKU", "nunique"))
             )
-            fig.update_geos(fitbounds="locations", visible=True)
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption(build_dynamic_explanation_elasticity(filtered, {"departamento": dept, "trimestre": trimestre, "estado": "mapa"}))
+            geo["Elasticidad absoluta"] = geo["elasticidad"].abs()
+            geo = add_state_coordinates(geo, estado_col=estado_col).dropna(subset=["lat", "lon"])
+            if geo.empty:
+                st.warning("No se pudieron homologar los estados a coordenadas de México.")
+            else:
+                fig = px.scatter_geo(
+                    geo,
+                    lat="lat",
+                    lon="lon",
+                    color="Elasticidad absoluta",
+                    size="Elasticidad absoluta",
+                    hover_name=estado_col,
+                    hover_data={"elasticidad": ":.3f", "SKUs": True, "lat": False, "lon": False},
+                    scope="north america",
+                    title="Intensidad de elasticidad absoluta por estado",
+                )
+                fig.update_geos(fitbounds="locations", visible=True)
+                st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Descarga")
-    elasticidad_csv = build_elasticity_download(df)
-    st.download_button(
-        "Descargar CSV de elasticidad por SKU y trimestre",
-        data=convert_df_to_csv(elasticidad_csv),
-        file_name="elasticidad_por_sku_trimestre.csv",
-        mime="text/csv",
-    )
+    all_csv = build_elasticity_download(df_periodo)
+    filtered_csv = build_elasticity_download(filtered)
+    if all_csv.empty:
+        st.warning("No hay elasticidades disponibles para descargar.")
+    else:
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "Descargar todas las elasticidades",
+                data=convert_df_to_csv(all_csv),
+                file_name="elasticidades_periodo.csv",
+                mime="text/csv",
+            )
+        with d2:
+            if filtered_csv.empty:
+                st.warning("No hay elasticidades filtradas disponibles para descargar.")
+            else:
+                st.download_button(
+                    "Descargar elasticidades filtradas",
+                    data=convert_df_to_csv(filtered_csv),
+                    file_name=filename_by_tipo[tipo_label],
+                    mime="text/csv",
+                )
 
 
 def render_pricing_view() -> None:
