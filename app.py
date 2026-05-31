@@ -167,6 +167,13 @@ def simulate_pricing_cached(
     return simulate_pricing_scenarios(ventas_base_elasticidad, elasticidad, bloques)
 
 
+def build_demand_forecast_cached(ventas_nse: pd.DataFrame) -> pd.DataFrame:
+    """Calcula demanda_base_futura sin recalcular elasticidad ni aplicar promociones."""
+    from modules.demand_forecast import build_demanda_base_futura
+
+    return build_demanda_base_futura(ventas_nse)
+
+
 @st.cache_data(show_spinner=False, max_entries=5)
 def build_historical_sales_ml_cached(ventas_nse: pd.DataFrame) -> dict:
     """Entrena modelos ML ligeros para entender ventas históricas antes del pronóstico."""
@@ -350,6 +357,7 @@ def init_state() -> None:
         "elasticity_ready": False,
         "pricing_ready": False,
         "historical_pricing_ready": False,
+        "demand_forecast_ready": False,
         "ventas_limpias": pd.DataFrame(),
         "ventas_nse": pd.DataFrame(),
         "promo_df": None,
@@ -362,6 +370,7 @@ def init_state() -> None:
         "simulacion": pd.DataFrame(),
         "resumen_pricing": pd.DataFrame(),
         "pricing_historico_escenarios": pd.DataFrame(),
+        "demanda_base_futura": pd.DataFrame(),
         "semaforo": pd.DataFrame(),
         "calidad_varianza": pd.DataFrame(),
         "resumen_limpieza": pd.DataFrame(),
@@ -373,7 +382,7 @@ def init_state() -> None:
         "quality_cache_key": None,
         "elasticity_cache_key": None,
         "pricing_cache_key": None,
-        "manual_cache": {"quality": {}, "elasticity": {}, "pricing": {}, "pricing_historico": {}},
+        "manual_cache": {"quality": {}, "elasticity": {}, "pricing": {}, "pricing_historico": {}, "demand_forecast": {}},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -385,6 +394,7 @@ def reset_model_results() -> None:
     st.session_state.elasticity_ready = False
     st.session_state.pricing_ready = False
     st.session_state.historical_pricing_ready = False
+    st.session_state.demand_forecast_ready = False
     st.session_state.elasticidad = pd.DataFrame()
     st.session_state.elasticidades_periodo = pd.DataFrame()
     st.session_state.ventas_base_elasticidad = pd.DataFrame()
@@ -393,6 +403,7 @@ def reset_model_results() -> None:
     st.session_state.simulacion = pd.DataFrame()
     st.session_state.resumen_pricing = pd.DataFrame()
     st.session_state.pricing_historico_escenarios = pd.DataFrame()
+    st.session_state.demanda_base_futura = pd.DataFrame()
 
 
 def render_sidebar() -> str:
@@ -482,7 +493,7 @@ def render_sidebar() -> str:
     process = st.sidebar.button("Procesar / actualizar datos", type="primary", use_container_width=True)
     if st.sidebar.button("Limpiar caché de esta sesión", use_container_width=True):
         st.cache_data.clear()
-        st.session_state.manual_cache = {"quality": {}, "elasticity": {}, "pricing": {}, "pricing_historico": {}}
+        st.session_state.manual_cache = {"quality": {}, "elasticity": {}, "pricing": {}, "pricing_historico": {}, "demand_forecast": {}}
         st.session_state.processed = False
         reset_model_results()
         st.sidebar.success("Caché limpiado. Vuelve a procesar la base si lo necesitas.")
@@ -692,7 +703,9 @@ def ensure_elasticity_ready(show_button: bool = True) -> bool:
         st.session_state.elasticity_ready = True
         st.session_state.pricing_ready = False
         st.session_state.historical_pricing_ready = False
+        st.session_state.demand_forecast_ready = False
         st.session_state.pricing_historico_escenarios = pd.DataFrame()
+        st.session_state.demanda_base_futura = pd.DataFrame()
         st.success("Elasticidad calculada correctamente. Cambiar filtros no volverá a calcularla.")
         return True
     except Exception as exc:
