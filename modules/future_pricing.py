@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .config import ELASTICIDAD_CAP_MAX, ELASTICIDAD_CAP_MIN
+from .promotions import escenarios_con_promociones, evaluar_riesgo_promocion, es_promocion
 from .utils import parse_transaction_dates
 
 ESCENARIOS_FUTUROS = pd.DataFrame(
@@ -28,6 +29,7 @@ ESCENARIOS_FUTUROS = pd.DataFrame(
     columns=["escenario_id", "nombre_escenario", "cambio_precio_pct"],
 )
 ESCENARIOS_FUTUROS["tipo_escenario"] = "cambio_precio_simple"
+ESCENARIOS_FUTUROS = escenarios_con_promociones(ESCENARIOS_FUTUROS)
 
 PRICING_FUTURO_ESCENARIOS_COLUMNS = [
     "SKU",
@@ -43,6 +45,7 @@ PRICING_FUTURO_ESCENARIOS_COLUMNS = [
     "precio_efectivo",
     "descuento_efectivo",
     "cambio_precio_pct",
+    "riesgo_promocion",
     "demanda_base",
     "unidades_simuladas",
     "ingreso_base",
@@ -132,7 +135,7 @@ def _build_price_base(ventas_precios: pd.DataFrame | None, demanda: pd.DataFrame
         if "precio_lista" not in out.columns:
             out["precio_lista"] = out["precio_actual"]
         if "costo_unitario" not in out.columns:
-            out["costo_unitario"] = 0.0
+            out["costo_unitario"] = np.nan
         return out
 
     ventas = _ensure_sku(ventas_precios)
@@ -159,8 +162,7 @@ def _build_price_base(ventas_precios: pd.DataFrame | None, demanda: pd.DataFrame
     work["_precio_lista"] = work["_precio_lista"].fillna(work["_precio_actual"])
 
     cost_col = _first_existing_column(work, ["costo_unitario", "costo2", "unit_cost", "costo"])
-    work["_costo_unitario"] = pd.to_numeric(work[cost_col], errors="coerce") if cost_col else 0.0
-    work["_costo_unitario"] = work["_costo_unitario"].fillna(0.0)
+    work["_costo_unitario"] = pd.to_numeric(work[cost_col], errors="coerce") if cost_col else np.nan
 
     date_col = _first_existing_column(work, ["tran_date", "fecha", "date", "fecha_transaccion", "fecha_venta"])
     if date_col:
@@ -257,13 +259,16 @@ def _risk_and_recommendation(row: pd.Series) -> tuple[str, str, str]:
     if row.get("confianza_final") in {"No usable", "Baja"}:
         risk = "Alto"
         reasons.append("confianza final insuficiente")
+    if es_promocion(row.get("tipo_escenario")) and row.get("riesgo_promocion") == "Alto":
+        risk = "Alto"
+        reasons.append("promoción no cumple guardrails de elasticidad, demanda, costo o margen")
     if row.get("elasticidad_usada", 0) >= 0 and row.get("cambio_precio_pct", 0) != 0:
         risk = "Alto"
         reasons.append("elasticidad positiva o atípica")
     if row.get("unidades_simuladas", 0) <= 0:
         risk = "Alto"
         reasons.append("unidades simuladas nulas")
-    if row.get("margen_simulado", 0) < 0:
+    if pd.notna(row.get("margen_simulado", np.nan)) and row.get("margen_simulado", 0) < 0:
         risk = "Alto"
         reasons.append("margen simulado negativo")
     if abs(row.get("cambio_precio_pct", 0)) >= 15 and row.get("confianza_final") != "Alta":
@@ -276,6 +281,8 @@ def _risk_and_recommendation(row: pd.Series) -> tuple[str, str, str]:
     if risk == "Alto":
         return risk, "No recomendar", "Escenario sospechoso: " + "; ".join(dict.fromkeys(reasons)) + "."
     if row.get("mejor_escenario", False):
+        if pd.isna(row.get("margen_simulado", np.nan)):
+            return risk, "Recomendar", "Maximiza ingreso simulado futuro. No se cuenta con costo unitario, por lo que la recomendación se basa en ingreso y no en margen."
         return risk, "Recomendar", "Maximiza margen simulado futuro entre escenarios válidos del mismo SKU, horizonte, método y elasticidad."
     if row.get("cambio_precio_pct", 0) == 0:
         return risk, "Mantener como referencia", "Escenario base contra el cual se comparan los cambios de precio futuros."
@@ -315,7 +322,7 @@ def build_pricing_futuro_escenarios(
 
     candidates["precio_actual"] = pd.to_numeric(candidates["precio_actual"], errors="coerce")
     candidates["precio_lista"] = pd.to_numeric(candidates["precio_lista"], errors="coerce").fillna(candidates["precio_actual"])
-    candidates["costo_unitario"] = pd.to_numeric(candidates.get("costo_unitario", 0.0), errors="coerce").fillna(0.0)
+    candidates["costo_unitario"] = pd.to_numeric(candidates.get("costo_unitario", np.nan), errors="coerce")
     candidates["elasticidad_usada"] = pd.to_numeric(candidates["elasticidad_usada"], errors="coerce").clip(ELASTICIDAD_CAP_MIN, ELASTICIDAD_CAP_MAX)
     candidates = candidates.replace([np.inf, -np.inf], np.nan)
     candidates = candidates[
@@ -333,18 +340,32 @@ def build_pricing_futuro_escenarios(
     sim = candidates.merge(esc, on="_join_key", how="inner").drop(columns="_join_key")
 
     cambio = pd.to_numeric(sim["cambio_precio_pct"], errors="coerce")
+    promo = es_promocion(sim["tipo_escenario"])
+    factor_precio = pd.to_numeric(sim.get("factor_precio", 1 + cambio), errors="coerce").fillna(1 + cambio)
     demand_factor = 1 + sim["elasticidad_usada"] * cambio
-    valid = sim["precio_actual"].gt(0) & (1 + cambio).gt(0) & sim["demanda_base"].gt(0) & np.isfinite(demand_factor)
+    valid = sim["precio_actual"].gt(0) & factor_precio.gt(0) & sim["demanda_base"].gt(0) & np.isfinite(demand_factor)
 
-    sim["precio_efectivo"] = np.where(valid, sim["precio_actual"] * (1 + cambio), np.nan)
+    sim["precio_efectivo"] = np.where(valid, sim["precio_actual"] * factor_precio, np.nan)
     sim["unidades_simuladas"] = np.where(valid, sim["demanda_base"] * demand_factor, np.nan)
     sim["unidades_simuladas"] = pd.to_numeric(sim["unidades_simuladas"], errors="coerce").clip(lower=0)
-    sim["descuento_efectivo"] = np.where(sim["precio_lista"].gt(0), 1 - (sim["precio_efectivo"] / sim["precio_lista"]), np.nan)
+    sim["descuento_efectivo"] = np.where(
+        promo,
+        pd.to_numeric(sim.get("descuento_efectivo"), errors="coerce"),
+        np.where(sim["precio_lista"].gt(0), 1 - (sim["precio_efectivo"] / sim["precio_lista"]), np.nan),
+    )
 
     sim["ingreso_base"] = sim["precio_actual"] * sim["demanda_base"]
     sim["ingreso_simulado"] = sim["precio_efectivo"] * sim["unidades_simuladas"]
-    sim["margen_base"] = (sim["precio_actual"] - sim["costo_unitario"]) * sim["demanda_base"]
-    sim["margen_simulado"] = (sim["precio_efectivo"] - sim["costo_unitario"]) * sim["unidades_simuladas"]
+    sim["margen_base"] = np.where(
+        sim["costo_unitario"].notna(),
+        (sim["precio_actual"] - sim["costo_unitario"]) * sim["demanda_base"],
+        np.nan,
+    )
+    sim["margen_simulado"] = np.where(
+        sim["costo_unitario"].notna(),
+        (sim["precio_efectivo"] - sim["costo_unitario"]) * sim["unidades_simuladas"],
+        np.nan,
+    )
     sim["variacion_unidades"] = sim["unidades_simuladas"] - sim["demanda_base"]
     sim["variacion_ingreso"] = sim["ingreso_simulado"] - sim["ingreso_base"]
     sim["variacion_margen"] = sim["margen_simulado"] - sim["margen_base"]
@@ -353,19 +374,33 @@ def build_pricing_futuro_escenarios(
     sim["confianza_demanda"] = sim["confianza_demanda"].fillna("No usable")
     final_rank = sim.apply(lambda r: min(_confidence_rank(r["confianza_elasticidad"]), _confidence_rank(r["confianza_demanda"])), axis=1)
     sim["confianza_final"] = final_rank.map(_rank_confidence)
+    missing_cost_promo = sim["costo_unitario"].isna() & es_promocion(sim["tipo_escenario"])
+    sim.loc[missing_cost_promo & sim["confianza_final"].eq("Alta"), "confianza_final"] = "Media"
+    sim.loc[missing_cost_promo & sim["confianza_final"].eq("Media"), "confianza_final"] = "Baja"
+    sim["riesgo_promocion"] = evaluar_riesgo_promocion(
+        sim["tipo_escenario"],
+        sim["elasticidad_usada"],
+        sim["demanda_base"],
+        sim["costo_unitario"],
+        sim["precio_efectivo"],
+        sim["margen_simulado"],
+        confianza_demanda=sim["confianza_demanda"],
+        confianza_elasticidad=sim["confianza_elasticidad"],
+    )
 
     group_cols = ["SKU", "horizonte", "metodo_proyeccion", "tipo_elasticidad_usada"]
     sim["mejor_escenario"] = False
     eligible = sim[
         sim["confianza_final"].isin(["Alta", "Media"])
-        & sim["margen_simulado"].ge(0)
+        & (~(es_promocion(sim["tipo_escenario"]) & sim["riesgo_promocion"].eq("Alto")))
+        & (sim["margen_simulado"].ge(0) | sim["margen_simulado"].isna())
         & sim["ingreso_simulado"].notna()
         & sim["unidades_simuladas"].gt(0)
     ]
     if not eligible.empty:
         best_idx = (
-            eligible.sort_values(
-                group_cols + ["margen_simulado", "ingreso_simulado", "unidades_simuladas"],
+            eligible.assign(_score_margen=eligible["margen_simulado"].fillna(eligible["ingreso_simulado"])).sort_values(
+                group_cols + ["_score_margen", "ingreso_simulado", "unidades_simuladas"],
                 ascending=[True, True, True, True, False, False, False],
                 kind="stable",
             )
@@ -385,7 +420,8 @@ def build_pricing_futuro_escenarios(
     out = sim[PRICING_FUTURO_ESCENARIOS_COLUMNS].replace([np.inf, -np.inf], np.nan)
     # Mantiene la tabla libre de NaN/inf en columnas críticas y evita romper SKUs insuficientes.
     numeric_cols = out.select_dtypes(include=[np.number]).columns
-    out[numeric_cols] = out[numeric_cols].fillna(0.0)
+    fill_numeric_cols = [col for col in numeric_cols if col not in {"margen_base", "margen_simulado", "variacion_margen"}]
+    out[fill_numeric_cols] = out[fill_numeric_cols].fillna(0.0)
     object_cols = [col for col in out.columns if col not in numeric_cols]
     out[object_cols] = out[object_cols].fillna("Sin dato")
     return out.sort_values(["horizonte", "metodo_proyeccion", "SKU", "tipo_elasticidad_usada", "cambio_precio_pct"]).reset_index(drop=True)
