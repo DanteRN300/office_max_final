@@ -1167,6 +1167,52 @@ def render_elasticity_view() -> None:
         if geo.empty:
             st.info("No hay estados/state disponibles en la base de ventas para construir el mapa con los filtros seleccionados.")
         else:
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1:
+            render_kpi_card("Elasticidad promedio", format_num(elasticidad_prom, 3), "Promedio filtrado")
+        with k2:
+            render_kpi_card("R² promedio", format_num(r2_prom, 3), "Ajuste promedio")
+        with k3:
+            render_kpi_card("SKUs analizados", f"{filtered['SKU'].nunique():,}", "Únicos")
+        with k4:
+            render_kpi_card("Registros", f"{len(filtered):,}", tipo_label)
+        with k5:
+            render_kpi_card("Confianza dominante", confianza_dom, "Moda")
+
+        st.subheader("Tabla de elasticidades")
+        filtered_display = build_elasticity_download(filtered)
+        st.dataframe(filtered_display, use_container_width=True, hide_index=True)
+
+        st.subheader("Serie de tiempo de demanda")
+        ventas_f = ventas
+        if ventas_f is None or ventas_f.empty:
+            st.warning("No hay ventas para la serie de tiempo con estos filtros.")
+        else:
+            if 'dept' in locals() and dept != "Todos" and "dept_nm" in ventas_f.columns:
+                ventas_f = ventas_f[ventas_f["dept_nm"].astype(str) == str(dept)]
+            if 'skus' in locals() and skus and selected_periodo_tipo != "categoria_departamento":
+                ventas_f = ventas_f[ventas_f["prod_nbr"].astype(str).isin(skus)]
+            if ventas_f.empty:
+                st.warning("No hay ventas para la serie de tiempo con estos filtros.")
+            else:
+                serie = aggregate_weekly_demand(ventas_f)
+                if "Promoción" in serie.columns:
+                    fig = px.line(serie, x="tran_date", y="Demanda", color="Promoción", title="Demanda semanal con/sin promoción")
+                else:
+                    fig = px.line(serie, x="tran_date", y="Demanda", title="Demanda semanal")
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Mapa geográfico de México")
+        estado_col = "estado" if "estado" in filtered.columns else None
+        if estado_col is None or filtered[estado_col].dropna().empty:
+            st.warning("No hay columna `estado` disponible para construir el mapa en elasticidades_periodo.")
+        else:
+            geo = (
+                filtered.dropna(subset=[estado_col])
+                .groupby(estado_col, as_index=False)
+                .agg(elasticidad=("elasticidad", "mean"), SKUs=("SKU", "nunique"))
+            )
             geo["Elasticidad absoluta"] = geo["elasticidad"].abs()
             geo = add_state_coordinates(geo, estado_col=estado_col).dropna(subset=["lat", "lon"])
             if geo.empty:
