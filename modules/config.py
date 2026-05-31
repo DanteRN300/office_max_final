@@ -37,7 +37,7 @@ COLUMNAS_LECTURA_VENTAS = [
     "subdept_nm", "categoria", "categoría", "category", "subcategoria", "sub_category",
     "marca", "tipo_marca",
     "categoria_est_socio", "nivel_socioeconomico", "nivel socioeconómico", "nse", "categoria_nse",
-    "estado", "municipio", "key", "id_municipio", "ubica_geo",
+    "estado", "state", "municipio", "key", "id_municipio", "ubica_geo",
 ]
 
 COLUMNAS_LECTURA_NSE = [
