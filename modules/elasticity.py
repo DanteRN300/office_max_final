@@ -1,4 +1,4 @@
-"""Cálculo de elasticidad trimestral."""
+"""Cálculo de elasticidad multi-periodo con compatibilidad trimestral."""
 
 from __future__ import annotations
 
@@ -119,6 +119,253 @@ def build_three_month_blocks(ventas_base: pd.DataFrame) -> list[dict]:
         )
     return bloques
 
+
+
+
+PERIODOS_ELASTICIDAD = [
+    "mensual",
+    "trimestral",
+    "semestral",
+    "anual",
+    "global_sku",
+    "categoria_departamento",
+]
+
+ELASTICIDADES_PERIODO_COLUMNS = [
+    "SKU",
+    "categoria",
+    "departamento",
+    "periodo_tipo",
+    "periodo",
+    "fecha_inicio",
+    "fecha_fin",
+    "elasticidad",
+    "r2",
+    "p_value",
+    "num_observaciones",
+    "num_precios_distintos",
+    "precio_promedio",
+    "unidades_promedio",
+    "ingreso_promedio",
+    "margen_promedio",
+    "confianza_elasticidad",
+    "recomendable_elasticidad",
+    "razon_no_recomendable",
+]
+
+
+def _finite_or_none(value):
+    """Devuelve None para NaN/inf y float para valores numéricos finitos."""
+    if value is None or pd.isna(value):
+        return None
+    try:
+        value_float = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value_float if np.isfinite(value_float) else None
+
+
+def _period_label(periodo_tipo: str, fecha_inicio, fecha_fin) -> str:
+    if periodo_tipo == "mensual":
+        return str(pd.Period(fecha_inicio, freq="M"))
+    if periodo_tipo == "trimestral":
+        return build_quarter_label(f"{pd.Period(fecha_inicio, freq='M')} a {pd.Period(fecha_fin, freq='M')}")
+    if periodo_tipo == "semestral":
+        return f"{pd.Period(fecha_inicio, freq='M')} a {pd.Period(fecha_fin, freq='M')}"
+    if periodo_tipo == "anual":
+        return str(pd.Timestamp(fecha_inicio).year)
+    if periodo_tipo == "global_sku":
+        return "global_sku"
+    if periodo_tipo == "categoria_departamento":
+        return "categoria_departamento"
+    return str(periodo_tipo)
+
+
+def build_period_blocks(ventas_base: pd.DataFrame, periodo_tipo: str) -> list[dict]:
+    """Crea bloques de tiempo para la elasticidad multi-periodo."""
+    if periodo_tipo not in PERIODOS_ELASTICIDAD:
+        raise ValueError(f"periodo_tipo inválido: {periodo_tipo}. Opciones: {', '.join(PERIODOS_ELASTICIDAD)}")
+
+    if ventas_base.empty:
+        return []
+
+    meses_ordenados = sorted(ventas_base["mes"].dropna().unique())
+    if not meses_ordenados:
+        return []
+
+    if periodo_tipo == "trimestral":
+        bloques = []
+        for bloque in build_three_month_blocks(ventas_base):
+            bloques.append(
+                {
+                    "periodo_tipo": periodo_tipo,
+                    "periodo": bloque["trimestre"],
+                    "fecha_inicio": bloque["mes_inicio"].to_timestamp(how="start").date(),
+                    "fecha_fin": bloque["mes_fin"].to_timestamp(how="end").date(),
+                    "meses": bloque["meses"],
+                    **bloque,
+                }
+            )
+        return bloques
+
+    if periodo_tipo == "mensual":
+        return [
+            {
+                "periodo_tipo": periodo_tipo,
+                "periodo": str(mes),
+                "fecha_inicio": mes.to_timestamp(how="start").date(),
+                "fecha_fin": mes.to_timestamp(how="end").date(),
+                "meses": [mes],
+            }
+            for mes in meses_ordenados
+        ]
+
+    if periodo_tipo == "semestral":
+        bloques = []
+        for i in range(0, len(meses_ordenados), 6):
+            meses_bloque = meses_ordenados[i : i + 6]
+            if len(meses_bloque) < 6:
+                continue
+            fecha_inicio = meses_bloque[0].to_timestamp(how="start").date()
+            fecha_fin = meses_bloque[-1].to_timestamp(how="end").date()
+            bloques.append(
+                {
+                    "periodo_tipo": periodo_tipo,
+                    "periodo": _period_label(periodo_tipo, fecha_inicio, fecha_fin),
+                    "fecha_inicio": fecha_inicio,
+                    "fecha_fin": fecha_fin,
+                    "meses": meses_bloque,
+                }
+            )
+        return bloques
+
+    if periodo_tipo == "anual":
+        bloques = []
+        meses_por_anio: dict[int, list] = {}
+        for mes in meses_ordenados:
+            meses_por_anio.setdefault(mes.year, []).append(mes)
+        for anio, meses_bloque in meses_por_anio.items():
+            meses_bloque = sorted(meses_bloque)
+            fecha_inicio = meses_bloque[0].to_timestamp(how="start").date()
+            fecha_fin = meses_bloque[-1].to_timestamp(how="end").date()
+            bloques.append(
+                {
+                    "periodo_tipo": periodo_tipo,
+                    "periodo": str(anio),
+                    "fecha_inicio": fecha_inicio,
+                    "fecha_fin": fecha_fin,
+                    "meses": meses_bloque,
+                }
+            )
+        return bloques
+
+    fecha_inicio = meses_ordenados[0].to_timestamp(how="start").date()
+    fecha_fin = meses_ordenados[-1].to_timestamp(how="end").date()
+    return [
+        {
+            "periodo_tipo": periodo_tipo,
+            "periodo": periodo_tipo,
+            "fecha_inicio": fecha_inicio,
+            "fecha_fin": fecha_fin,
+            "meses": meses_ordenados,
+        }
+    ]
+
+
+def evaluar_confianza_elasticidad(estimacion: dict, metricas: dict | None = None) -> dict:
+    """Clasifica confianza y recomendabilidad de una elasticidad estimada."""
+    metricas = metricas or {}
+    elasticidad = _finite_or_none(estimacion.get("Elasticidad"))
+    r2 = _finite_or_none(estimacion.get("R2"))
+    p_value = _finite_or_none(estimacion.get("P_Value"))
+    n_obs = int(metricas.get("num_observaciones") or estimacion.get("Observaciones_Modelo") or 0)
+    n_modelo = int(estimacion.get("Observaciones_Modelo") or 0)
+    precios = int(metricas.get("num_precios_distintos") or estimacion.get("Precios_Distintos_Modelo") or 0)
+
+    razones_no_usable = []
+    if elasticidad is None:
+        razones_no_usable.append(estimacion.get("Motivo_Modelo") or "elasticidad NaN o infinita")
+    elif elasticidad > 0:
+        razones_no_usable.append("elasticidad positiva")
+    elif elasticidad == 0:
+        razones_no_usable.append("elasticidad cero sospechosa")
+    if n_obs < MIN_OBSERVACIONES or n_modelo < MIN_OBSERVACIONES:
+        razones_no_usable.append("datos insuficientes")
+    if precios < 3:
+        razones_no_usable.append("menos de 3 precios distintos")
+
+    if razones_no_usable:
+        return {
+            "confianza_elasticidad": "No usable",
+            "recomendable_elasticidad": False,
+            "razon_no_recomendable": "; ".join(dict.fromkeys(str(r) for r in razones_no_usable if r)),
+        }
+
+    razones_baja = []
+    if n_obs < 8 or n_modelo < 5:
+        razones_baja.append("pocos datos")
+    if r2 is None or r2 < 0.15:
+        razones_baja.append("bajo R2")
+    if p_value is not None and p_value > 0.20:
+        razones_baja.append("p-value alto")
+    if elasticidad < -10:
+        razones_baja.append("comportamiento inestable")
+
+    if razones_baja:
+        return {
+            "confianza_elasticidad": "Baja",
+            "recomendable_elasticidad": False,
+            "razon_no_recomendable": "; ".join(razones_baja),
+        }
+
+    if n_obs >= 15 and n_modelo >= 10 and precios >= 4 and r2 is not None and r2 >= 0.50 and -5 <= elasticidad < 0:
+        return {
+            "confianza_elasticidad": "Alta",
+            "recomendable_elasticidad": True,
+            "razon_no_recomendable": "",
+        }
+
+    return {
+        "confianza_elasticidad": "Media",
+        "recomendable_elasticidad": True,
+        "razon_no_recomendable": "",
+    }
+
+
+def _metricas_periodo(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {
+            "num_observaciones": 0,
+            "num_precios_distintos": 0,
+            "precio_promedio": None,
+            "unidades_promedio": None,
+            "ingreso_promedio": None,
+            "margen_promedio": None,
+        }
+
+    margen = pd.Series(np.nan, index=df.index, dtype="float64")
+    if "margen_total" in df.columns:
+        margen = pd.to_numeric(df["margen_total"], errors="coerce")
+    elif "margen_unitario" in df.columns:
+        margen = pd.to_numeric(df["margen_unitario"], errors="coerce") * pd.to_numeric(df["qty"], errors="coerce")
+    elif "costo_unitario" in df.columns:
+        margen = pd.to_numeric(df["net_sale"], errors="coerce") - (pd.to_numeric(df["costo_unitario"], errors="coerce") * pd.to_numeric(df["qty"], errors="coerce"))
+    elif "costo2" in df.columns:
+        margen = pd.to_numeric(df["net_sale"], errors="coerce") - (pd.to_numeric(df["costo2"], errors="coerce") * pd.to_numeric(df["qty"], errors="coerce"))
+
+    valores = {
+        "num_observaciones": int(len(df)),
+        "num_precios_distintos": int(df["precio_unitario"].round(2).nunique()) if "precio_unitario" in df.columns else 0,
+        "precio_promedio": _finite_or_none(pd.to_numeric(df.get("precio_unitario"), errors="coerce").mean()),
+        "unidades_promedio": _finite_or_none(pd.to_numeric(df.get("qty"), errors="coerce").mean()),
+        "ingreso_promedio": _finite_or_none(pd.to_numeric(df.get("net_sale"), errors="coerce").mean()),
+        "margen_promedio": _finite_or_none(margen.mean()),
+    }
+    return valores
+
+
+def _empty_elasticidades_periodo() -> pd.DataFrame:
+    return pd.DataFrame(columns=ELASTICIDADES_PERIODO_COLUMNS)
 
 def diagnosticar_elasticidad(beta) -> str:
     """Diagnóstico interpretativo de elasticidad."""
@@ -324,16 +571,13 @@ def mejor_estimacion_con_fallback(
     return estimacion
 
 
-def calculate_elasticity(
+
+
+def _preparar_ventas_elasticidad(
     ventas_nse: pd.DataFrame,
     promociones: pd.DataFrame | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
-    """Calcula elasticidad trimestral robusta por SKU usando la base limpia + NSE.
-
-    La entrada debe ser la base maestra generada en la vista 1:
-    ventas_nse = ventas limpias + cruce con NSE. Así la elasticidad conserva
-    categoria_est_socio y estado para las vistas posteriores.
-    """
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Normaliza ventas para cualquier cálculo de elasticidad."""
     ventas = ventas_nse.copy()
     ventas.columns = ventas.columns.astype(str).str.strip()
 
@@ -348,6 +592,15 @@ def calculate_elasticity(
         ventas["precio_unitario"] = pd.to_numeric(ventas["precio_unitario"], errors="coerce")
         ventas["precio_unitario"] = ventas["precio_unitario"].fillna(ventas["net_sale"] / ventas["qty"])
 
+    if "costo_unitario" not in ventas.columns and "costo2" in ventas.columns:
+        ventas["costo_unitario"] = pd.to_numeric(ventas["costo2"], errors="coerce")
+    elif "costo_unitario" in ventas.columns:
+        ventas["costo_unitario"] = pd.to_numeric(ventas["costo_unitario"], errors="coerce")
+
+    if "costo_unitario" in ventas.columns:
+        ventas["margen_unitario"] = ventas["precio_unitario"] - ventas["costo_unitario"]
+        ventas["margen_total"] = ventas["margen_unitario"] * ventas["qty"]
+
     ventas = ventas.replace([np.inf, -np.inf], np.nan)
     ventas = ventas.dropna(subset=["tran_date", "qty", "net_sale", "prod_nbr", "precio_unitario"]).copy()
     ventas = ventas[(ventas["qty"] > 0) & (ventas["net_sale"] > 0) & (ventas["precio_unitario"] > 0)].copy()
@@ -358,6 +611,166 @@ def calculate_elasticity(
 
     ventas = integrate_promotions(ventas, promociones)
     bloques = build_three_month_blocks(ventas)
+    return ventas, bloques
+
+
+def _row_elasticidad_periodo(
+    sku: str,
+    df_sku: pd.DataFrame,
+    bloque: dict,
+    estimacion: dict,
+    periodo_tipo: str,
+    categoria: str | None = None,
+    departamento: str | None = None,
+) -> dict:
+    metricas = _metricas_periodo(df_sku)
+    confianza = evaluar_confianza_elasticidad(estimacion, metricas)
+    return {
+        "SKU": str(sku),
+        "categoria": categoria if categoria is not None else _moda_segura(df_sku, "subdept_nm"),
+        "departamento": departamento if departamento is not None else _moda_segura(df_sku, "dept_nm"),
+        "periodo_tipo": periodo_tipo,
+        "periodo": bloque["periodo"],
+        "fecha_inicio": bloque["fecha_inicio"],
+        "fecha_fin": bloque["fecha_fin"],
+        "elasticidad": _finite_or_none(estimacion.get("Elasticidad")),
+        "r2": _finite_or_none(estimacion.get("R2")),
+        "p_value": _finite_or_none(estimacion.get("P_Value")),
+        **metricas,
+        **confianza,
+    }
+
+
+def _fallback_categoria_departamento(
+    df_sku: pd.DataFrame,
+    df_periodo: pd.DataFrame,
+    periodo_tipo: str,
+) -> dict | None:
+    """Intenta fallback confiable por categoría y departamento para un SKU-periodo."""
+    categoria = _moda_segura(df_sku, "subdept_nm")
+    departamento = _moda_segura(df_sku, "dept_nm")
+
+    candidatos: list[tuple[str, pd.DataFrame]] = []
+    if pd.notna(categoria) and "subdept_nm" in df_periodo.columns:
+        candidatos.append(("Categoría/departamento-periodo", df_periodo[df_periodo["subdept_nm"] == categoria].copy()))
+    if pd.notna(departamento) and "dept_nm" in df_periodo.columns:
+        candidatos.append(("Departamento-periodo", df_periodo[df_periodo["dept_nm"] == departamento].copy()))
+
+    for fuente, df_fallback in candidatos:
+        est = estimar_elasticidad_loglog(df_fallback, fuente=f"{fuente}-{periodo_tipo}")
+        metricas = _metricas_periodo(df_fallback)
+        confianza = evaluar_confianza_elasticidad(est, metricas)
+        if confianza["recomendable_elasticidad"]:
+            est["Motivo_Modelo"] = f"Fallback confiable: {fuente}"
+            return est
+    return None
+
+
+def _calculate_elasticity_period_prepared(ventas: pd.DataFrame, periodo_tipo: str) -> pd.DataFrame:
+    """Calcula la tabla interna elasticidades_periodo para un periodo_tipo."""
+    if periodo_tipo not in PERIODOS_ELASTICIDAD:
+        raise ValueError(f"periodo_tipo inválido: {periodo_tipo}. Opciones: {', '.join(PERIODOS_ELASTICIDAD)}")
+    if ventas.empty:
+        return _empty_elasticidades_periodo()
+
+    resultados = []
+    bloques = build_period_blocks(ventas, periodo_tipo)
+
+    if periodo_tipo == "categoria_departamento":
+        for bloque in bloques:
+            df_periodo = ventas[ventas["mes"].isin(bloque["meses"])].copy()
+            group_cols = [col for col in ["subdept_nm", "dept_nm"] if col in df_periodo.columns]
+            if not group_cols:
+                continue
+            for keys, df_grupo in df_periodo.groupby(group_cols, dropna=False):
+                if not isinstance(keys, tuple):
+                    keys = (keys,)
+                valores = dict(zip(group_cols, keys))
+                categoria = valores.get("subdept_nm", np.nan)
+                departamento = valores.get("dept_nm", np.nan)
+                est = estimar_elasticidad_loglog(df_grupo, fuente="Categoría/departamento-global")
+                resultados.append(
+                    _row_elasticidad_periodo(
+                        sku=f"{departamento}|{categoria}",
+                        df_sku=df_grupo,
+                        bloque=bloque,
+                        estimacion=est,
+                        periodo_tipo=periodo_tipo,
+                        categoria=categoria,
+                        departamento=departamento,
+                    )
+                )
+        return pd.DataFrame(resultados, columns=ELASTICIDADES_PERIODO_COLUMNS).replace([np.inf, -np.inf], np.nan)
+
+    for bloque in bloques:
+        df_periodo = ventas[ventas["mes"].isin(bloque["meses"])].copy()
+        for sku, df_sku in df_periodo.groupby("prod_nbr"):
+            fuente = f"SKU-{periodo_tipo}"
+            est = estimar_elasticidad_loglog(df_sku, fuente=fuente)
+            metricas = _metricas_periodo(df_sku)
+            confianza = evaluar_confianza_elasticidad(est, metricas)
+            if not confianza["recomendable_elasticidad"]:
+                fallback = _fallback_categoria_departamento(df_sku, df_periodo, periodo_tipo)
+                if fallback is not None:
+                    est = fallback
+
+            resultados.append(_row_elasticidad_periodo(sku, df_sku, bloque, est, periodo_tipo))
+
+    out = pd.DataFrame(resultados, columns=ELASTICIDADES_PERIODO_COLUMNS)
+    if not out.empty:
+        out = out.replace([np.inf, -np.inf], np.nan).sort_values(
+            by=["SKU", "periodo_tipo", "fecha_inicio"], kind="stable"
+        ).reset_index(drop=True)
+    return out
+
+
+def calculate_elasticity_by_period(
+    ventas_nse: pd.DataFrame,
+    promociones: pd.DataFrame | None = None,
+    periodo_tipo: str = "trimestral",
+) -> pd.DataFrame:
+    """Función general de elasticidad para mensual/trimestral/semestral/anual/global/fallback."""
+    ventas, _ = _preparar_ventas_elasticidad(ventas_nse, promociones)
+    return _calculate_elasticity_period_prepared(ventas, periodo_tipo)
+
+
+def calculate_elasticidades_periodo(
+    ventas_nse: pd.DataFrame,
+    promociones: pd.DataFrame | None = None,
+    periodo_tipos: list[str] | None = None,
+) -> pd.DataFrame:
+    """Construye la tabla interna elasticidades_periodo para todos los niveles solicitados."""
+    periodo_tipos = periodo_tipos or PERIODOS_ELASTICIDAD
+    ventas, _ = _preparar_ventas_elasticidad(ventas_nse, promociones)
+    tablas = [_calculate_elasticity_period_prepared(ventas, periodo_tipo) for periodo_tipo in periodo_tipos]
+    tablas = [tabla for tabla in tablas if tabla is not None and not tabla.empty]
+    if not tablas:
+        return _empty_elasticidades_periodo()
+    elasticidades_periodo = pd.concat(tablas, ignore_index=True)
+    elasticidades_periodo = elasticidades_periodo.replace([np.inf, -np.inf], np.nan)
+    return elasticidades_periodo[ELASTICIDADES_PERIODO_COLUMNS]
+
+def calculate_elasticity(
+    ventas_nse: pd.DataFrame,
+    promociones: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+    """Calcula elasticidad trimestral robusta por SKU usando la base limpia + NSE.
+
+    La entrada debe ser la base maestra generada en la vista 1:
+    ventas_nse = ventas limpias + cruce con NSE. Así la elasticidad conserva
+    categoria_est_socio y estado para las vistas posteriores.
+    """
+    ventas, bloques = _preparar_ventas_elasticidad(ventas_nse, promociones)
+    tablas_periodo = [
+        _calculate_elasticity_period_prepared(ventas, periodo_tipo)
+        for periodo_tipo in PERIODOS_ELASTICIDAD
+    ]
+    tablas_periodo = [tabla for tabla in tablas_periodo if tabla is not None and not tabla.empty]
+    elasticidades_periodo = (
+        pd.concat(tablas_periodo, ignore_index=True)[ELASTICIDADES_PERIODO_COLUMNS]
+        if tablas_periodo
+        else _empty_elasticidades_periodo()
+    )
 
     resultados = []
 
@@ -413,6 +826,9 @@ def calculate_elasticity(
     if not elasticidad.empty:
         elasticidad = elasticidad.replace([np.inf, -np.inf], np.nan)
         elasticidad = elasticidad.sort_values(by=["prod_nbr", "mes_inicio"]).reset_index(drop=True)
+
+    elasticidad.attrs["elasticidades_periodo"] = elasticidades_periodo
+    ventas.attrs["elasticidades_periodo"] = elasticidades_periodo
 
     return elasticidad, ventas, bloques
 
