@@ -11,3 +11,8 @@ def test_streamlit_app_and_model_modules_compile():
         "modules/historical_ml.py",
     ]:
         py_compile.compile(str(repo_root / relative_path), doraise=True)
+def test_streamlit_app_and_elasticity_module_compile():
+    """Regression check for syntax/indentation errors in Streamlit deploy files."""
+    repo_root = Path(__file__).resolve().parents[1]
+    py_compile.compile(str(repo_root / "app.py"), doraise=True)
+    py_compile.compile(str(repo_root / "modules" / "elasticity.py"), doraise=True)
