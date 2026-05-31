@@ -175,6 +175,18 @@ def build_demand_forecast_cached(ventas_nse: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, max_entries=5)
+def build_future_pricing_cached(
+    demanda_base_futura: pd.DataFrame,
+    elasticidades_periodo: pd.DataFrame,
+    ventas_nse: pd.DataFrame,
+) -> pd.DataFrame:
+    """Simula pricing futuro usando demanda_base_futura y elasticidades ya calculadas."""
+    from modules.future_pricing import build_pricing_futuro_escenarios
+
+    return build_pricing_futuro_escenarios(demanda_base_futura, elasticidades_periodo, ventas_nse)
+
+
+@st.cache_data(show_spinner=False, max_entries=5)
 def build_historical_sales_ml_cached(ventas_nse: pd.DataFrame) -> dict:
     """Entrena modelos ML ligeros para entender ventas históricas antes del pronóstico."""
     from modules.historical_ml import build_historical_sales_ml_summary
@@ -358,6 +370,7 @@ def init_state() -> None:
         "pricing_ready": False,
         "historical_pricing_ready": False,
         "demand_forecast_ready": False,
+        "future_pricing_ready": False,
         "ventas_limpias": pd.DataFrame(),
         "ventas_nse": pd.DataFrame(),
         "promo_df": None,
@@ -371,6 +384,7 @@ def init_state() -> None:
         "resumen_pricing": pd.DataFrame(),
         "pricing_historico_escenarios": pd.DataFrame(),
         "demanda_base_futura": pd.DataFrame(),
+        "pricing_futuro_escenarios": pd.DataFrame(),
         "semaforo": pd.DataFrame(),
         "calidad_varianza": pd.DataFrame(),
         "resumen_limpieza": pd.DataFrame(),
@@ -382,7 +396,7 @@ def init_state() -> None:
         "quality_cache_key": None,
         "elasticity_cache_key": None,
         "pricing_cache_key": None,
-        "manual_cache": {"quality": {}, "elasticity": {}, "pricing": {}, "pricing_historico": {}, "demand_forecast": {}},
+        "manual_cache": {"quality": {}, "elasticity": {}, "pricing": {}, "pricing_historico": {}, "demand_forecast": {}, "pricing_futuro": {}},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -395,6 +409,7 @@ def reset_model_results() -> None:
     st.session_state.pricing_ready = False
     st.session_state.historical_pricing_ready = False
     st.session_state.demand_forecast_ready = False
+    st.session_state.future_pricing_ready = False
     st.session_state.elasticidad = pd.DataFrame()
     st.session_state.elasticidades_periodo = pd.DataFrame()
     st.session_state.ventas_base_elasticidad = pd.DataFrame()
@@ -404,6 +419,7 @@ def reset_model_results() -> None:
     st.session_state.resumen_pricing = pd.DataFrame()
     st.session_state.pricing_historico_escenarios = pd.DataFrame()
     st.session_state.demanda_base_futura = pd.DataFrame()
+    st.session_state.pricing_futuro_escenarios = pd.DataFrame()
 
 
 def render_sidebar() -> str:
@@ -417,6 +433,7 @@ def render_sidebar() -> str:
             "1. Carga y diagnóstico de datos",
             "2. Elasticidad",
             "3. Pricing histórico (backtesting)",
+            "4. Pricing futuro (simulador)",
         ],
     )
 
@@ -704,8 +721,10 @@ def ensure_elasticity_ready(show_button: bool = True) -> bool:
         st.session_state.pricing_ready = False
         st.session_state.historical_pricing_ready = False
         st.session_state.demand_forecast_ready = False
+        st.session_state.future_pricing_ready = False
         st.session_state.pricing_historico_escenarios = pd.DataFrame()
         st.session_state.demanda_base_futura = pd.DataFrame()
+        st.session_state.pricing_futuro_escenarios = pd.DataFrame()
         st.success("Elasticidad calculada correctamente. Cambiar filtros no volverá a calcularla.")
         return True
     except Exception as exc:
@@ -895,6 +914,172 @@ def ensure_historical_pricing_ready() -> bool:
         st.error(f"No se pudo calcular pricing histórico: {exc}")
         return False
 
+
+
+def ensure_future_pricing_ready() -> bool:
+    """Calcula pricing futuro con demanda_base_futura y elasticidades ya calculadas."""
+    if not st.session_state.processed:
+        return False
+
+    if st.session_state.get("ventas_nse") is None or st.session_state.ventas_nse.empty:
+        st.warning("Primero procesa la base en la vista **1. Carga y diagnóstico de datos**.")
+        return False
+
+    elasticidades_periodo = st.session_state.get("elasticidades_periodo", pd.DataFrame())
+    if (
+        not st.session_state.get("elasticity_ready", False)
+        or elasticidades_periodo is None
+        or elasticidades_periodo.empty
+    ):
+        st.warning(
+            "Primero calcula la elasticidad en la vista **2. Elasticidad**. "
+            "El simulador futuro usa exclusivamente elasticidades ya calculadas."
+        )
+        return False
+
+    analysis_key = (
+        st.session_state.get("sales_signature"),
+        st.session_state.get("nse_signature"),
+        st.session_state.get("promo_signature"),
+    )
+    elasticity_key = st.session_state.get("elasticity_cache_key")
+    if isinstance(elasticity_key, tuple) and elasticity_key[:3] != analysis_key:
+        st.warning(
+            "La elasticidad guardada no corresponde a la base actual de ventas + NSE + promociones. "
+            "Vuelve a calcular elasticidad en la vista **2. Elasticidad**."
+        )
+        st.session_state.future_pricing_ready = False
+        return False
+
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        button_clicked = st.button(
+            "Calcular / actualizar pricing futuro",
+            type="primary" if not st.session_state.future_pricing_ready else "secondary",
+            use_container_width=True,
+        )
+    with col_b:
+        st.caption(
+            "Fase 5: primero construye `demanda_base_futura` para horizontes de 1 y 3 meses; "
+            "luego aplica elasticidades existentes a escenarios de -20% a +20%."
+        )
+
+    if st.session_state.future_pricing_ready and not button_clicked:
+        return True
+
+    if not button_clicked and not st.session_state.future_pricing_ready:
+        st.info("Presiona **Calcular / actualizar pricing futuro** para ejecutar la Fase 5.")
+        return False
+
+    try:
+        pricing_key = (analysis_key, "pricing_futuro_escenarios_v1")
+        cache_pr = st.session_state.manual_cache.setdefault("pricing_futuro", {})
+        if pricing_key in cache_pr:
+            demanda_base_futura, pricing_futuro_escenarios = cache_pr[pricing_key]
+        else:
+            with st.spinner("Calculando demanda_base_futura y simulando escenarios futuros..."):
+                demanda_base_futura = build_demand_forecast_cached(st.session_state.ventas_nse)
+                pricing_futuro_escenarios = build_future_pricing_cached(
+                    demanda_base_futura,
+                    elasticidades_periodo,
+                    st.session_state.ventas_nse,
+                )
+            cache_pr.clear()
+            cache_pr[pricing_key] = (demanda_base_futura, pricing_futuro_escenarios)
+
+        st.session_state.demanda_base_futura = demanda_base_futura
+        st.session_state.pricing_futuro_escenarios = pricing_futuro_escenarios
+        st.session_state.demand_forecast_ready = True
+        st.session_state.future_pricing_ready = True
+        st.session_state.historical_pricing_ready = False
+        st.session_state.pricing_ready = False
+        st.success("Pricing futuro calculado correctamente usando demanda_base_futura y elasticidades existentes.")
+        return True
+    except Exception as exc:
+        st.session_state.future_pricing_ready = False
+        st.error(f"No se pudo calcular pricing futuro: {exc}")
+        return False
+
+
+def render_future_pricing_view() -> None:
+    """Vista 4: Future Pricing Simulator (Fase 5)."""
+    st.title("4. Pricing futuro (simulador)")
+    st.caption("Fase 5: escenarios futuros de pricing para horizontes de 1 mes y 3 meses.")
+    st.info(
+        "Este módulo **no recalcula elasticidad**. Usa `demanda_base_futura` y "
+        "`elasticidades_periodo` ya calculadas para simular escenarios simples de cambio de precio."
+    )
+
+    if not require_processed():
+        return
+    if not ensure_future_pricing_ready():
+        return
+
+    sim = st.session_state.pricing_futuro_escenarios
+    demanda = st.session_state.demanda_base_futura
+    if sim is None or sim.empty:
+        st.warning("No hay escenarios futuros. Revisa demanda_base_futura, precios actuales y elasticidades disponibles.")
+        if demanda is not None and not demanda.empty:
+            st.subheader("Tabla interna: demanda_base_futura")
+            st.dataframe(demanda, use_container_width=True)
+        return
+
+    st.subheader("Filtros")
+    f1, f2, f3, f4 = st.columns(4)
+    horizonte = _dependent_selectbox("Horizonte", ["Todos"] + _safe_sorted_options(sim, "horizonte"), "future_pricing_horizonte", "Todos", f1)
+    df_h = _filter_fast(sim, "horizonte", horizonte)
+    metodo = _dependent_selectbox("Método", ["Todos"] + _safe_sorted_options(df_h, "metodo_proyeccion"), "future_pricing_metodo", "Todos", f2)
+    df_m = _filter_fast(df_h, "metodo_proyeccion", metodo)
+    sku = _dependent_selectbox("SKU", ["Todos"] + _safe_sorted_options(df_m, "SKU"), "future_pricing_sku", "Todos", f3)
+    df_s = _filter_fast(df_m, "SKU", sku)
+    escenario = _dependent_selectbox("Escenario", ["Todos"] + _safe_sorted_options(df_s, "nombre_escenario"), "future_pricing_escenario", "Todos", f4)
+    selected = _filter_fast(df_s, "nombre_escenario", escenario)
+
+    if selected.empty:
+        st.warning("No hay resultados para la combinación de filtros seleccionada.")
+        return
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        render_kpi_card("Unidades simuladas", format_num(selected["unidades_simuladas"].sum(), 0), "Futuro")
+    with k2:
+        render_kpi_card("Ingreso simulado", format_money(selected["ingreso_simulado"].sum()), "Futuro")
+    with k3:
+        render_kpi_card("Margen simulado", format_money(selected["margen_simulado"].sum()), "Futuro")
+    with k4:
+        pct_reco = (selected["recomendacion"].eq("Recomendar").mean() * 100) if "recomendacion" in selected.columns else 0
+        render_kpi_card("Escenarios recomendados", f"{pct_reco:.1f}%", "Dentro del filtro")
+
+    st.subheader("Confianza y riesgo")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.dataframe(selected["confianza_final"].value_counts(dropna=False).rename_axis("confianza_final").reset_index(name="Escenarios"), use_container_width=True)
+    with c2:
+        st.dataframe(selected["riesgo"].value_counts(dropna=False).rename_axis("riesgo").reset_index(name="Escenarios"), use_container_width=True)
+
+    st.subheader("Tabla interna: pricing_futuro_escenarios")
+    table_cols = [
+        "SKU", "categoria", "departamento", "horizonte", "metodo_proyeccion",
+        "tipo_elasticidad_usada", "nombre_escenario", "precio_actual", "precio_lista",
+        "precio_efectivo", "descuento_efectivo", "cambio_precio_pct", "demanda_base",
+        "unidades_simuladas", "ingreso_base", "ingreso_simulado", "margen_base",
+        "margen_simulado", "variacion_unidades", "variacion_ingreso", "variacion_margen",
+        "elasticidad_usada", "confianza_elasticidad", "confianza_demanda", "confianza_final",
+        "riesgo", "recomendacion", "razon_recomendacion",
+    ]
+    st.dataframe(selected[[col for col in table_cols if col in selected.columns]], use_container_width=True)
+
+    with st.expander("Ver demanda_base_futura usada", expanded=False):
+        st.dataframe(demanda, use_container_width=True)
+
+    st.subheader("Descarga")
+    st.download_button(
+        "Descargar pricing_futuro_escenarios filtrado",
+        data=_df_to_excel_friendly_csv_bytes(selected, sep=";"),
+        file_name="pricing_futuro_escenarios.csv",
+        mime="text/csv; charset=utf-8",
+        use_container_width=True,
+    )
 
 def render_historical_pricing_view() -> None:
     """Vista 3: Historical Pricing Simulator separado de pricing futuro."""
@@ -2076,7 +2261,11 @@ def main() -> None:
         render_elasticity_view()
         return
 
-    render_historical_pricing_view()
+    if vista.startswith("3."):
+        render_historical_pricing_view()
+        return
+
+    render_future_pricing_view()
 
 
 if __name__ == "__main__":
