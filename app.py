@@ -338,6 +338,7 @@ def init_state() -> None:
         "ventas_nse": pd.DataFrame(),
         "promo_df": None,
         "elasticidad": pd.DataFrame(),
+        "elasticidades_periodo": pd.DataFrame(),
         "ventas_base_elasticidad": pd.DataFrame(),
         "ventas_base_pricing": pd.DataFrame(),
         "bloques": [],
@@ -367,6 +368,7 @@ def reset_model_results() -> None:
     st.session_state.elasticity_ready = False
     st.session_state.pricing_ready = False
     st.session_state.elasticidad = pd.DataFrame()
+    st.session_state.elasticidades_periodo = pd.DataFrame()
     st.session_state.ventas_base_elasticidad = pd.DataFrame()
     st.session_state.bloques = []
     st.session_state.base_pricing = pd.DataFrame()
@@ -653,6 +655,10 @@ def ensure_elasticity_ready(show_button: bool = True) -> bool:
 
         st.session_state.elasticity_cache_key = cache_key
         st.session_state.elasticidad = elasticidad
+        st.session_state.elasticidades_periodo = elasticidad.attrs.get(
+            "elasticidades_periodo",
+            ventas_base_elasticidad.attrs.get("elasticidades_periodo", pd.DataFrame()),
+        )
         st.session_state.ventas_base_elasticidad = ventas_base_elasticidad
         st.session_state.bloques = bloques
         st.session_state.elasticity_ready = True
