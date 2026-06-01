@@ -1617,6 +1617,138 @@ def render_exportables_view() -> None:
             )
 
 
+def _ventas_fase_promocion(ventas_nse: pd.DataFrame, ventanas: pd.DataFrame, sku: str) -> pd.DataFrame:
+    """Etiqueta las ventas semanales de un SKU como Antes / Durante / Después de promoción.
+
+    Toma la primera ventana de promoción del SKU y compara una ventana simétrica de
+    semanas antes y después. Devuelve un DataFrame con columnas `semana`, `unidades`,
+    `fase`. Si no hay datos suficientes, devuelve vacío (no crashea).
+    """
+    from modules.utils import parse_transaction_dates
+
+    if ventas_nse is None or ventas_nse.empty or ventanas is None or ventanas.empty:
+        return pd.DataFrame()
+
+    vent_sku = ventanas[ventanas["SKU"].astype(str) == str(sku)].dropna(subset=["fecha_inicio"])
+    if vent_sku.empty:
+        return pd.DataFrame()
+    inicio = pd.to_datetime(vent_sku["fecha_inicio"].min())
+    fin = pd.to_datetime(vent_sku["fecha_fin"].max())
+    if pd.isna(fin) or fin < inicio:
+        fin = inicio
+
+    ventas = ventas_nse.copy()
+    sku_col = "SKU" if "SKU" in ventas.columns else ("prod_nbr" if "prod_nbr" in ventas.columns else None)
+    if sku_col is None or "qty" not in ventas.columns or "tran_date" not in ventas.columns:
+        return pd.DataFrame()
+    ventas = ventas[ventas[sku_col].astype(str) == str(sku)].copy()
+    if ventas.empty:
+        return pd.DataFrame()
+
+    ventas["tran_date"] = parse_transaction_dates(ventas["tran_date"])
+    ventas["qty"] = pd.to_numeric(ventas["qty"], errors="coerce")
+    ventas = ventas.dropna(subset=["tran_date", "qty"])
+    if ventas.empty:
+        return pd.DataFrame()
+
+    duracion = max((fin - inicio).days, 7)
+    margen = pd.Timedelta(days=duracion)
+    desde = inicio - margen
+    hasta = fin + margen
+    ventana = ventas[(ventas["tran_date"] >= desde) & (ventas["tran_date"] <= hasta)].copy()
+    if ventana.empty:
+        return pd.DataFrame()
+
+    def _fase(fecha):
+        if fecha < inicio:
+            return "Antes"
+        if fecha <= fin:
+            return "Durante"
+        return "Después"
+
+    ventana["fase"] = ventana["tran_date"].map(_fase)
+    serie = (
+        ventana.groupby([pd.Grouper(key="tran_date", freq="W"), "fase"], observed=True)["qty"]
+        .sum()
+        .reset_index()
+        .rename(columns={"tran_date": "semana", "qty": "unidades"})
+    )
+    return serie
+
+
+def render_promociones_historico(selected: pd.DataFrame) -> None:
+    """Sección de promociones dentro del pricing histórico (antes/durante/después)."""
+    from modules.promotions import normalizar_ventanas_promocion
+
+    st.subheader("Impacto de promociones en ventas reales")
+
+    promo_df = st.session_state.get("promo_df")
+    ventanas = normalizar_ventanas_promocion(promo_df)
+
+    if promo_df is None or (isinstance(promo_df, pd.DataFrame) and promo_df.empty):
+        st.info(
+            "No se subió una base de promociones. Es **opcional**: cárgala en la barra lateral "
+            "(sección B) para ver el efecto de las promociones en las ventas reales. "
+            "Las promociones detectadas sí se incorporan al cálculo de elasticidad cuando se proveen."
+        )
+        return
+
+    if ventanas.empty:
+        st.warning(
+            "La base de promociones se cargó pero no se reconocieron columnas de SKU/fecha. "
+            "Asegúrate de incluir un identificador de SKU (`prod_nbr`/`SKU`) y una fecha de inicio "
+            "(`fecha_inicio`/`start_date`)."
+        )
+        return
+
+    skus_con_promo = sorted(ventanas["SKU"].astype(str).unique())
+    st.success(
+        f"Base de promociones considerada: {len(ventanas)} ventanas de promoción sobre "
+        f"{len(skus_con_promo)} SKU(s). También se usa al calcular elasticidad."
+    )
+
+    # SKUs presentes en el filtro actual que además tienen promoción.
+    skus_filtro = set(selected["SKU"].astype(str).unique()) if "SKU" in selected.columns else set()
+    opciones = [s for s in skus_con_promo if not skus_filtro or s in skus_filtro] or skus_con_promo
+    sku_promo = st.selectbox(
+        "SKU para ver ventas antes / durante / después de la promoción",
+        opciones,
+        key="hist_promo_sku",
+    )
+
+    serie = _ventas_fase_promocion(st.session_state.get("ventas_nse", pd.DataFrame()), ventanas, sku_promo)
+    if serie.empty:
+        st.info("No hay suficientes ventas alrededor de la promoción de este SKU para graficar.")
+        return
+
+    import plotly.express as px
+
+    orden = {"Antes": 0, "Durante": 1, "Después": 2}
+    serie = serie.sort_values("semana")
+    fig = px.bar(
+        serie, x="semana", y="unidades", color="fase",
+        category_orders={"fase": ["Antes", "Durante", "Después"]},
+        title=f"Ventas semanales del SKU {sku_promo}: antes, durante y después de la promoción",
+    )
+    fig.update_layout(xaxis_title="Semana", yaxis_title="Unidades vendidas", legend_title="Fase")
+    st.plotly_chart(fig, use_container_width=True)
+
+    resumen = (
+        serie.groupby("fase", observed=True)["unidades"]
+        .agg(["sum", "mean"])
+        .reindex(["Antes", "Durante", "Después"])
+        .rename(columns={"sum": "Unidades totales", "mean": "Promedio semanal"})
+        .reset_index()
+        .rename(columns={"fase": "Fase"})
+    )
+    st.dataframe(resumen, use_container_width=True)
+    antes = resumen.loc[resumen["Fase"].eq("Antes"), "Promedio semanal"].fillna(0).sum()
+    durante = resumen.loc[resumen["Fase"].eq("Durante"), "Promedio semanal"].fillna(0).sum()
+    if antes > 0:
+        cambio = (durante - antes) / antes * 100
+        st.caption(f"Durante la promoción, el promedio semanal de unidades cambió {cambio:+.1f}% frente al periodo previo.")
+
+
 def render_historical_pricing_view() -> None:
     """Vista 3: Historical Pricing Simulator separado de pricing futuro."""
     st.title("3. Pricing histórico (backtesting)")
@@ -1727,6 +1859,8 @@ def render_historical_pricing_view() -> None:
         chart_long = chart.melt(id_vars="nombre_escenario", var_name="métrica", value_name="monto")
         fig = px.bar(chart_long, x="nombre_escenario", y="monto", color="métrica", barmode="group", title="Real vs simulado por escenario histórico")
         st.plotly_chart(fig, use_container_width=True)
+
+    render_promociones_historico(selected)
 
     st.subheader("Tabla interna: pricing_historico_escenarios")
     table_cols = [

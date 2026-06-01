@@ -147,3 +147,54 @@ def razon_promocion_no_margen(costo_unitario) -> pd.Series | bool:
     if isinstance(costo_unitario, pd.Series):
         return pd.to_numeric(costo_unitario, errors="coerce").isna()
     return pd.isna(costo_unitario)
+
+
+# Columnas candidatas para detectar la base de promociones opcional subida por el usuario.
+_PROMO_COLS_SKU = ["prod_nbr", "SKU", "sku", "producto", "product_id", "item_id"]
+_PROMO_COLS_INICIO = [
+    "fecha_inicio", "inicio_promocion", "fecha_ini", "start_date", "Start_Date",
+    "tran_date", "fecha",
+]
+_PROMO_COLS_FIN = [
+    "fecha_fin", "fin_promocion", "fecha_final", "end_date", "End_Date",
+    "fecha_termino", "fecha_término",
+]
+
+
+def normalizar_ventanas_promocion(promociones: "pd.DataFrame | None") -> pd.DataFrame:
+    """Normaliza la base de promociones a ventanas (SKU, fecha_inicio, fecha_fin).
+
+    Devuelve un DataFrame con columnas ``SKU``, ``fecha_inicio``, ``fecha_fin`` y,
+    si existe, ``mecanica``. Detecta de forma flexible los nombres de columna. Si no
+    se reconoce SKU o fecha de inicio, devuelve un DataFrame vacío (nunca crashea).
+    """
+    from .utils import parse_transaction_dates
+
+    columnas = ["SKU", "fecha_inicio", "fecha_fin", "mecanica"]
+    if promociones is None or promociones.empty:
+        return pd.DataFrame(columns=columnas)
+
+    promos = promociones.copy()
+    promos.columns = promos.columns.astype(str).str.strip()
+
+    col_sku = next((c for c in _PROMO_COLS_SKU if c in promos.columns), None)
+    col_inicio = next((c for c in _PROMO_COLS_INICIO if c in promos.columns), None)
+    if col_sku is None or col_inicio is None:
+        return pd.DataFrame(columns=columnas)
+
+    col_fin = next((c for c in _PROMO_COLS_FIN if c in promos.columns), None)
+    col_mecanica = next((c for c in ["mecanica", "mecánica", "tipo_promo", "promo", "descripcion", "2x1", "3x2"] if c in promos.columns), None)
+
+    out = pd.DataFrame()
+    out["SKU"] = promos[col_sku].astype("string").str.strip().astype(str)
+    out["fecha_inicio"] = parse_transaction_dates(promos[col_inicio])
+    if col_fin is not None:
+        out["fecha_fin"] = parse_transaction_dates(promos[col_fin])
+    else:
+        out["fecha_fin"] = out["fecha_inicio"]
+    out["fecha_fin"] = out["fecha_fin"].fillna(out["fecha_inicio"])
+    out["mecanica"] = promos[col_mecanica].astype(str) if col_mecanica is not None else "Promoción"
+
+    out = out.dropna(subset=["SKU", "fecha_inicio"])
+    out = out[out["SKU"].ne("") & out["SKU"].ne("nan")]
+    return out[columnas].reset_index(drop=True)
