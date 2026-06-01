@@ -481,10 +481,11 @@ def _empty_elasticity_periodo_frame() -> pd.DataFrame:
     """Devuelve una tabla vacía segura con el esquema mínimo esperado."""
     return pd.DataFrame(columns=ELASTICITY_EXPECTED_COLUMNS)
 
-def _df_to_excel_friendly_csv_bytes(df: pd.DataFrame, sep: str = ";") -> bytes:
-    """CSV compatible con Excel en configuración regional de México/España.
+def _df_to_excel_friendly_csv_bytes(df: pd.DataFrame, sep: str = ",") -> bytes:
+    """CSV estándar separado por comas, compatible con Excel y Google Sheets.
 
-    Usa UTF-8 con BOM y separador `;` para que Excel abra columnas correctamente.
+    Usa coma como separador (estándar CSV universal) y UTF-8 con BOM para que los
+    acentos se vean bien. Así cada campo cae en su propia columna al abrirlo.
     """
     if df is None or df.empty:
         return b""
@@ -492,7 +493,7 @@ def _df_to_excel_friendly_csv_bytes(df: pd.DataFrame, sep: str = ";") -> bytes:
     return clean.to_csv(index=False, sep=sep, encoding="utf-8-sig", lineterminator="\n").encode("utf-8-sig")
 
 
-def _dataframes_to_zip_csv_bytes(files: dict[str, pd.DataFrame], sep: str = ";") -> bytes:
+def _dataframes_to_zip_csv_bytes(files: dict[str, pd.DataFrame], sep: str = ",") -> bytes:
     """Empaqueta uno o varios DataFrames como CSV dentro de un ZIP en memoria."""
     import io
     import zipfile
@@ -1192,6 +1193,118 @@ DEMANDA_VENTANAS_MANUAL = [
 ]
 
 
+def _ranking_escenarios_futuro(selected: pd.DataFrame) -> pd.DataFrame:
+    """Agrega los escenarios filtrados y los ordena por atractivo (margen, luego ingreso).
+
+    Cuando hay costo, el mejor escenario es el de mayor margen simulado; si no hay
+    costo, se usa el ingreso simulado. Solo considera escenarios viables (unidades
+    > 0, precio efectivo > 0 y, si es promoción, sin riesgo Alto).
+    """
+    if selected is None or selected.empty:
+        return pd.DataFrame()
+
+    viables = selected.copy()
+    viables["unidades_simuladas"] = pd.to_numeric(viables["unidades_simuladas"], errors="coerce")
+    viables["precio_efectivo"] = pd.to_numeric(viables["precio_efectivo"], errors="coerce")
+    viables = viables[viables["unidades_simuladas"].gt(0) & viables["precio_efectivo"].gt(0)]
+    if "riesgo_promocion" in viables.columns and "tipo_escenario" in viables.columns:
+        es_promo = viables["tipo_escenario"].eq("promocional")
+        viables = viables[~(es_promo & viables["riesgo_promocion"].eq("Alto"))]
+    if viables.empty:
+        return pd.DataFrame()
+
+    ranking = (
+        viables.groupby("nombre_escenario", observed=True, sort=False)
+        .agg(
+            unidades_simuladas=("unidades_simuladas", "sum"),
+            ingreso_simulado=("ingreso_simulado", "sum"),
+            margen_simulado=("margen_simulado", "sum"),
+            cambio_precio_pct=("cambio_precio_pct", "mean"),
+        )
+        .reset_index()
+    )
+    hay_margen = ranking["margen_simulado"].notna().any()
+    ranking["_score"] = ranking["margen_simulado"] if hay_margen else ranking["ingreso_simulado"]
+    ranking = ranking.sort_values(
+        ["_score", "ingreso_simulado"], ascending=[False, False], na_position="last"
+    ).reset_index(drop=True)
+    return ranking
+
+
+def _mejor_escenario_futuro(selected: pd.DataFrame) -> tuple[str, str]:
+    """Devuelve (nombre_mejor_escenario, subtítulo) para la tarjeta de indicador."""
+    ranking = _ranking_escenarios_futuro(selected)
+    if ranking.empty:
+        return "Sin escenario viable", "Revisa filtros"
+    fila = ranking.iloc[0]
+    if pd.notna(fila.get("margen_simulado")) and ranking["margen_simulado"].notna().any():
+        sub = f"Margen {format_money(fila['margen_simulado'])}"
+    else:
+        sub = f"Ingreso {format_money(fila['ingreso_simulado'])}"
+    return str(fila["nombre_escenario"]), sub
+
+
+def _render_mejor_escenario_detalle(selected: pd.DataFrame) -> None:
+    """Muestra un resumen del mejor escenario y el ranking completo."""
+    ranking = _ranking_escenarios_futuro(selected)
+    if ranking.empty:
+        st.info("No hay un escenario viable para la selección actual (sin unidades o precios válidos).")
+        return
+
+    mejor = ranking.iloc[0]
+    skus_sel = selected["SKU"].nunique()
+    alcance = "el SKU seleccionado" if skus_sel == 1 else f"los {skus_sel} SKUs filtrados"
+    if pd.notna(mejor.get("margen_simulado")) and ranking["margen_simulado"].notna().any():
+        criterio = f"mayor **margen simulado** ({format_money(mejor['margen_simulado'])})"
+    else:
+        criterio = f"mayor **ingreso simulado** ({format_money(mejor['ingreso_simulado'])})"
+    st.success(
+        f"Para {alcance}, el mejor escenario es **{mejor['nombre_escenario']}** "
+        f"(cambio de precio promedio {mejor['cambio_precio_pct']:+.1f}%), por {criterio}."
+    )
+
+    ranking_display = ranking.drop(columns=["_score"]).rename(
+        columns={
+            "nombre_escenario": "Escenario",
+            "unidades_simuladas": "Unidades simuladas",
+            "ingreso_simulado": "Ingreso simulado",
+            "margen_simulado": "Margen simulado",
+            "cambio_precio_pct": "Cambio precio %",
+        }
+    )
+    st.dataframe(ranking_display, use_container_width=True)
+
+
+def _render_graficas_futuro(selected: pd.DataFrame) -> None:
+    """Renderiza gráficas de ingreso/margen y unidades por escenario."""
+    import plotly.express as px
+
+    ranking = _ranking_escenarios_futuro(selected)
+    if ranking.empty:
+        st.info("No hay datos suficientes para graficar escenarios.")
+        return
+
+    g1, g2 = st.columns(2)
+    with g1:
+        value_vars = [c for c in ["ingreso_simulado", "margen_simulado"] if ranking[c].notna().any()]
+        chart_long = ranking.melt(
+            id_vars="nombre_escenario", value_vars=value_vars, var_name="métrica", value_name="monto"
+        )
+        fig_money = px.bar(
+            chart_long, x="nombre_escenario", y="monto", color="métrica", barmode="group",
+            title="Ingreso y margen simulado por escenario",
+        )
+        fig_money.update_layout(xaxis_title="Escenario", yaxis_title="Monto", legend_title="")
+        st.plotly_chart(fig_money, use_container_width=True)
+    with g2:
+        fig_units = px.bar(
+            ranking, x="nombre_escenario", y="unidades_simuladas",
+            title="Unidades simuladas por escenario",
+        )
+        fig_units.update_layout(xaxis_title="Escenario", yaxis_title="Unidades", showlegend=False)
+        st.plotly_chart(fig_units, use_container_width=True)
+
+
 def render_future_pricing_controls() -> None:
     """Controles de horizonte y método de proyección (Vista 4, Fase 8)."""
     st.subheader("Configuración de proyección de demanda")
@@ -1273,7 +1386,7 @@ def render_future_pricing_view() -> None:
         st.warning("No hay resultados para la combinación de filtros seleccionada.")
         return
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     with k1:
         render_kpi_card("Unidades simuladas", format_num(selected["unidades_simuladas"].sum(), 0), "Futuro")
     with k2:
@@ -1283,6 +1396,15 @@ def render_future_pricing_view() -> None:
     with k4:
         pct_reco = (selected["recomendacion"].eq("Recomendar").mean() * 100) if "recomendacion" in selected.columns else 0
         render_kpi_card("Escenarios recomendados", f"{pct_reco:.1f}%", "Dentro del filtro")
+    with k5:
+        mejor_nombre, mejor_sub = _mejor_escenario_futuro(selected)
+        render_kpi_card("Mejor escenario", mejor_nombre, mejor_sub)
+
+    st.subheader("Mejor escenario según filtros")
+    _render_mejor_escenario_detalle(selected)
+
+    st.subheader("Gráficas de escenarios")
+    _render_graficas_futuro(selected)
 
     st.subheader("Confianza y riesgo")
     c1, c2 = st.columns(2)
@@ -1309,7 +1431,7 @@ def render_future_pricing_view() -> None:
     st.subheader("Descarga")
     st.download_button(
         "Descargar pricing_futuro_escenarios filtrado",
-        data=_df_to_excel_friendly_csv_bytes(selected, sep=";"),
+        data=_df_to_excel_friendly_csv_bytes(selected, sep=","),
         file_name="pricing_futuro_escenarios.csv",
         mime="text/csv; charset=utf-8",
         use_container_width=True,
@@ -1447,7 +1569,7 @@ def render_recommendations_view() -> None:
     st.subheader("Descarga")
     st.download_button(
         "Descargar recomendaciones_sku filtrado",
-        data=_df_to_excel_friendly_csv_bytes(selected, sep=";"),
+        data=_df_to_excel_friendly_csv_bytes(selected, sep=","),
         file_name="recomendaciones_sku.csv",
         mime="text/csv; charset=utf-8",
         use_container_width=True,
@@ -1486,7 +1608,7 @@ def render_exportables_view() -> None:
         with col_b:
             st.download_button(
                 f"Descargar {file_name}",
-                data=_df_to_excel_friendly_csv_bytes(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), sep=";"),
+                data=_df_to_excel_friendly_csv_bytes(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), sep=","),
                 file_name=file_name,
                 mime="text/csv; charset=utf-8",
                 use_container_width=True,
@@ -1620,7 +1742,7 @@ def render_historical_pricing_view() -> None:
     st.subheader("Descarga")
     st.download_button(
         "Descargar pricing_historico_escenarios filtrado",
-        data=_df_to_excel_friendly_csv_bytes(selected, sep=";"),
+        data=_df_to_excel_friendly_csv_bytes(selected, sep=","),
         file_name="pricing_historico_escenarios.csv",
         mime="text/csv; charset=utf-8",
         use_container_width=True,
@@ -1859,15 +1981,6 @@ def render_elasticity_view() -> None:
         "Categoría/Departamento": "categoria_departamento",
     }
 
-    filename_by_tipo = {
-        "Todos": "elasticidades_filtradas.csv",
-        "Mensual": "elasticidades_mensual.csv",
-        "Trimestral": "elasticidades_trimestral.csv",
-        "Semestral": "elasticidades_semestral.csv",
-        "Anual": "elasticidades_anual.csv",
-        "Global SKU": "elasticidades_global_sku.csv",
-        "Categoría/Departamento": "elasticidades_categoria_departamento.csv",
-    }
 
     label_by_periodo = {v: k for k, v in tipo_labels.items() if v is not None}
 
@@ -2362,35 +2475,17 @@ def render_elasticity_view() -> None:
     st.subheader("Descarga")
 
     all_csv = prepare_elasticity_dataframe_for_display(build_elasticity_download(df_periodo))
-    filtered_csv = prepare_elasticity_dataframe_for_display(build_elasticity_download(filtered))
 
     if all_csv.empty:
         st.warning("No hay elasticidades disponibles para descargar.")
-
     else:
-        d1, d2 = st.columns(2)
-
-        with d1:
-            st.download_button(
-                "Descargar todas las elasticidades",
-                data=_df_to_excel_friendly_csv_bytes(all_csv, sep=";"),
-                file_name="elasticidades_periodo.csv",
-                mime="text/csv; charset=utf-8",
-                key="elasticity_download_all_button",
-            )
-
-        with d2:
-            if filtered_csv.empty:
-                st.warning("No hay elasticidades filtradas disponibles para descargar.")
-
-            else:
-                st.download_button(
-                    "Descargar elasticidades filtradas",
-                    data=_df_to_excel_friendly_csv_bytes(filtered_csv, sep=";"),
-                    file_name=filename_by_tipo[tipo_label],
-                    mime="text/csv; charset=utf-8",
-                    key="elasticity_download_filtered_button",
-                )
+        st.download_button(
+            "Descargar todas las elasticidades",
+            data=_df_to_excel_friendly_csv_bytes(all_csv, sep=","),
+            file_name="elasticidades_periodo.csv",
+            mime="text/csv; charset=utf-8",
+            key="elasticity_download_all_button",
+        )
 
 
 def render_pricing_view() -> None:
@@ -2643,9 +2738,9 @@ def render_pricing_view() -> None:
                         {
                             "pricing_todos_los_escenarios.csv": exp_csv,
                         },
-                        sep=";",
+                        sep=",",
                     )
-                    st.session_state.pricing_best_csv_bytes = _df_to_excel_friendly_csv_bytes(best_csv, sep=";")
+                    st.session_state.pricing_best_csv_bytes = _df_to_excel_friendly_csv_bytes(best_csv, sep=",")
                     st.session_state.pricing_download_rows = len(exp_csv)
                     st.session_state.pricing_best_rows = len(best_csv) if best_csv is not None else 0
                     st.session_state.pricing_download_key = download_key
