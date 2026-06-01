@@ -567,15 +567,9 @@ def simulate_pricing_scenarios(
     simulacion = simulacion.rename(columns={"Cambio_Efectivo": "Cambio_Precio"})
     simulacion["Cambio_Precio_%"] = simulacion["Cambio_Precio"] * 100
     simulacion["Descuento_Equivalente_%"] = np.where(simulacion["Cambio_Precio"] < 0, simulacion["Cambio_Precio"].abs() * 100, 0)
-    simulacion["tipo_escenario"] = np.select(
-        [
-            simulacion["Mecanica_Promocion"].eq("2x1"),
-            simulacion["Mecanica_Promocion"].eq("3x2"),
-            simulacion["Mecanica_Promocion"].eq("2do al 50%"),
-        ],
-        ["promocion_2x1", "promocion_3x2", "promocion_segundo_50"],
-        default="cambio_precio_simple",
-    )
+    # Especificación Fase 6: tipo_escenario es "simple" o "promocional".
+    es_promo = simulacion["Mecanica_Promocion"].isin(["2x1", "3x2", "2do al 50%"])
+    simulacion["tipo_escenario"] = np.where(es_promo, "promocional", "simple")
     simulacion["nombre_escenario"] = simulacion["Nombre_Escenario"]
     simulacion["precio_lista"] = simulacion["Precio_Base"]
     simulacion["precio_efectivo"] = simulacion["Precio_Nuevo"]

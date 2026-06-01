@@ -7,6 +7,7 @@ módulos posteriores del pricing futuro.
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 
 import numpy as np
@@ -98,6 +99,35 @@ def _projection_dates(last_month: pd.Period, horizonte: str) -> tuple[pd.Timesta
     return start_period.to_timestamp(how="start").date(), end_period.to_timestamp(how="end").date()
 
 
+def _coerce_to_month_period(series: pd.Series) -> pd.Series:
+    """Convierte de forma segura una columna `mes` a periodos mensuales.
+
+    Acepta valores que ya son ``Period``/``PeriodIndex`` o fechas (``2024-11``,
+    ``2024-11-01``...). Si la columna trae números de mes sueltos (1..12) u otros
+    valores no fechables, devuelve ``NaT`` en lugar de lanzar una excepción, ya que
+    un número de mes aislado no identifica un periodo histórico real.
+    """
+    # Caso 1: ya es un periodo. Se normaliza a frecuencia mensual vía el accessor .dt.
+    if isinstance(series.dtype, pd.PeriodDtype):
+        if series.dtype.freq.freqstr == "M":
+            return series
+        return series.dt.asfreq("M")
+
+    # Caso 2: números sueltos (1..12). pd.to_datetime los interpretaría como
+    # nanosegundos desde epoch (1970), por eso se descartan: un número de mes
+    # aislado no identifica un periodo histórico real.
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.Series(pd.NaT, index=series.index)
+
+    # Caso 3: fechas/strings fechables -> se convierten con coerción.
+    fechas = pd.to_datetime(series, errors="coerce")
+    if fechas.notna().any():
+        return fechas.dt.to_period("M")
+
+    # Caso 4: no es fechable. No es un periodo real.
+    return pd.Series(pd.NaT, index=series.index)
+
+
 def _prepare_monthly_sales(ventas: pd.DataFrame) -> pd.DataFrame:
     if ventas is None or ventas.empty:
         return pd.DataFrame()
@@ -115,12 +145,18 @@ def _prepare_monthly_sales(ventas: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("No se encontró columna de unidades (`qty`) para calcular demanda futura.")
 
     work = out.copy()
-    if "mes" not in work.columns:
+    # Se prioriza SIEMPRE la columna de fecha real para derivar el mes, porque otras
+    # etapas (p. ej. el motor de elasticidad) pueden dejar una columna `mes` con números
+    # de mes enteros (1..12). Forzar pd.PeriodIndex sobre esos enteros provoca el error
+    # "Given date string \"11\" not likely a datetime". Solo se usa `mes` preexistente
+    # si no hay columna de fecha, y siempre con conversión segura.
+    if date_col is not None:
         work[date_col] = parse_transaction_dates(work[date_col])
         work = work.dropna(subset=[date_col])
         work["mes"] = work[date_col].dt.to_period("M")
     else:
-        work["mes"] = pd.PeriodIndex(work["mes"], freq="M")
+        work["mes"] = _coerce_to_month_period(work["mes"])
+        work = work.dropna(subset=["mes"])
 
     work["qty"] = pd.to_numeric(work[qty_col], errors="coerce")
     work = work.dropna(subset=["SKU", "mes", "qty"])
@@ -324,7 +360,9 @@ def build_demanda_base_futura(
                         "promedio_ultimos_24_meses": components["ultimos_24_meses"]["valor_1m"],
                         "promedio_mismo_mes_historico": components["mismo_mes_historico"]["valor_1m"],
                         "promedio_mismo_trimestre_historico": components["mismo_trimestre_historico"]["valor_3m"],
-                        "pesos_usados": weights_used,
+                        # La especificación exige almacenar los pesos como JSON string,
+                        # no como dict, para que la tabla sea serializable y exportable.
+                        "pesos_usados": json.dumps(weights_used, ensure_ascii=False, sort_keys=True),
                         "confianza_demanda": confidence,
                         "razon_confianza_demanda": reason,
                     }

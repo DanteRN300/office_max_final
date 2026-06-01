@@ -28,7 +28,7 @@ ESCENARIOS_FUTUROS = pd.DataFrame(
     ],
     columns=["escenario_id", "nombre_escenario", "cambio_precio_pct"],
 )
-ESCENARIOS_FUTUROS["tipo_escenario"] = "cambio_precio_simple"
+ESCENARIOS_FUTUROS["tipo_escenario"] = "simple"
 ESCENARIOS_FUTUROS = escenarios_con_promociones(ESCENARIOS_FUTUROS)
 
 PRICING_FUTURO_ESCENARIOS_COLUMNS = [
@@ -366,7 +366,10 @@ def build_pricing_futuro_escenarios(
         (sim["precio_efectivo"] - sim["costo_unitario"]) * sim["unidades_simuladas"],
         np.nan,
     )
-    sim["variacion_unidades"] = sim["unidades_simuladas"] - sim["demanda_base"]
+    # Especificación Fase 5: variacion_unidades es la variación RELATIVA respecto a la
+    # demanda base, (unidades_simuladas - demanda_base) / demanda_base. demanda_base ya
+    # viene filtrada a > 0, por lo que la división es segura.
+    sim["variacion_unidades"] = (sim["unidades_simuladas"] - sim["demanda_base"]) / sim["demanda_base"]
     sim["variacion_ingreso"] = sim["ingreso_simulado"] - sim["ingreso_base"]
     sim["variacion_margen"] = sim["margen_simulado"] - sim["margen_base"]
 

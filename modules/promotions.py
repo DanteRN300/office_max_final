@@ -7,12 +7,18 @@ import pandas as pd
 
 DEMANDA_BASE_BAJA_MINIMA = 5
 
+# Especificación Fase 6: `tipo_escenario` debe ser "simple" o "promocional".
+# La identidad concreta de la promoción (2x1/3x2/2do 50%) se conserva en
+# `escenario_id` y `nombre_escenario`, no en `tipo_escenario`.
+TIPO_ESCENARIO_SIMPLE = "simple"
+TIPO_ESCENARIO_PROMOCIONAL = "promocional"
+
 PROMOCIONES_PRICING = pd.DataFrame(
     [
         {
             "escenario_id": "promocion_2x1",
             "nombre_escenario": "promoción 2x1",
-            "tipo_escenario": "promocion_2x1",
+            "tipo_escenario": TIPO_ESCENARIO_PROMOCIONAL,
             "factor_precio": 0.50,
             "descuento_efectivo": 0.50,
             "cambio_precio_pct": -0.50,
@@ -20,7 +26,7 @@ PROMOCIONES_PRICING = pd.DataFrame(
         {
             "escenario_id": "promocion_3x2",
             "nombre_escenario": "promoción 3x2",
-            "tipo_escenario": "promocion_3x2",
+            "tipo_escenario": TIPO_ESCENARIO_PROMOCIONAL,
             "factor_precio": 2 / 3,
             "descuento_efectivo": 0.3333,
             "cambio_precio_pct": -0.3333,
@@ -28,7 +34,7 @@ PROMOCIONES_PRICING = pd.DataFrame(
         {
             "escenario_id": "promocion_segundo_50",
             "nombre_escenario": "promoción segundo producto al 50%",
-            "tipo_escenario": "promocion_segundo_50",
+            "tipo_escenario": TIPO_ESCENARIO_PROMOCIONAL,
             "factor_precio": 0.75,
             "descuento_efectivo": 0.25,
             "cambio_precio_pct": -0.25,
@@ -36,7 +42,15 @@ PROMOCIONES_PRICING = pd.DataFrame(
     ]
 )
 
-PROMOTION_TYPES = set(PROMOCIONES_PRICING["tipo_escenario"])
+# Valores reconocidos como promoción. Incluye el valor canónico "promocional" y,
+# por compatibilidad, los identificadores granulares legacy que aún emite
+# modules/pricing.py.
+PROMOTION_TYPES = {
+    TIPO_ESCENARIO_PROMOCIONAL,
+    "promocion_2x1",
+    "promocion_3x2",
+    "promocion_segundo_50",
+}
 
 
 def escenarios_con_promociones(escenarios_base: pd.DataFrame) -> pd.DataFrame:
@@ -68,8 +82,12 @@ def evaluar_riesgo_promocion(
 ) -> pd.Series:
     """Devuelve Bajo/Medio/Alto para promociones según guardrails de negocio."""
     idx = getattr(tipo_escenario, "index", None)
-    riesgo = pd.Series("Bajo", index=idx) if idx is not None else "Bajo"
     promo = es_promocion(tipo_escenario)
+
+    # Escala de riesgo promocional según especificación Fase 6:
+    # "Alto" | "Medio" | "Bajo" | "No evaluar". Las filas que NO son promoción
+    # se marcan "No evaluar" porque el riesgo promocional no aplica a ellas.
+    _BAJA = {"baja", "no usable", "no recomendable"}
 
     def _serie(value, index):
         if isinstance(value, pd.Series):
@@ -78,16 +96,22 @@ def evaluar_riesgo_promocion(
 
     if idx is None:
         if not promo:
-            return riesgo
+            return "No evaluar"
         elasticidad_ok = pd.notna(elasticidad) and np.isfinite(elasticidad) and elasticidad < 0
         costo_ok = pd.isna(costo_unitario) or (pd.notna(precio_efectivo) and costo_unitario < precio_efectivo)
         demanda_ok = pd.notna(demanda_base) and demanda_base >= DEMANDA_BASE_BAJA_MINIMA
         margen_ok = pd.isna(margen_simulado) or margen_simulado >= 0
-        baja_conf = str(confianza_demanda).strip().lower() in {"baja", "no usable", "no recomendable"} or str(confianza_elasticidad).strip().lower() in {"baja", "no usable", "no recomendable"}
+        conf_d = str(confianza_demanda).strip().lower()
+        conf_e = str(confianza_elasticidad).strip().lower()
         if not elasticidad_ok or not costo_ok or not demanda_ok or not margen_ok:
             return "Alto"
-        return "Alto" if baja_conf else "Bajo"
+        if conf_d in _BAJA or conf_e in _BAJA:
+            return "Alto"
+        if conf_d == "media" or conf_e == "media":
+            return "Medio"
+        return "Bajo"
 
+    riesgo = pd.Series("No evaluar", index=idx)
     elasticidad_s = pd.to_numeric(_serie(elasticidad, idx), errors="coerce")
     demanda_s = pd.to_numeric(_serie(demanda_base, idx), errors="coerce")
     costo_s = pd.to_numeric(_serie(costo_unitario, idx), errors="coerce")
@@ -96,7 +120,7 @@ def evaluar_riesgo_promocion(
     conf_dem = _serie(confianza_demanda, idx).astype(str).str.strip().str.lower()
     conf_ela = _serie(confianza_elasticidad, idx).astype(str).str.strip().str.lower()
 
-    high = promo & (
+    hard_fail = (
         elasticidad_s.isna()
         | ~np.isfinite(elasticidad_s)
         | elasticidad_s.ge(0)
@@ -106,8 +130,15 @@ def evaluar_riesgo_promocion(
         | (costo_s.notna() & costo_s.ge(precio_s))
         | margen_s.lt(0)
     )
-    low_conf = promo & (conf_dem.isin({"baja", "no usable", "no recomendable"}) | conf_ela.isin({"baja", "no usable", "no recomendable"}))
-    riesgo.loc[high | low_conf] = "Alto"
+    low_conf = conf_dem.isin(_BAJA) | conf_ela.isin(_BAJA)
+    medium_conf = conf_dem.eq("media") | conf_ela.eq("media")
+
+    alto = promo & (hard_fail | low_conf)
+    medio = promo & ~alto & medium_conf
+    bajo = promo & ~alto & ~medio
+    riesgo.loc[alto] = "Alto"
+    riesgo.loc[medio] = "Medio"
+    riesgo.loc[bajo] = "Bajo"
     return riesgo
 
 

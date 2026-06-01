@@ -167,11 +167,34 @@ def simulate_pricing_cached(
     return simulate_pricing_scenarios(ventas_base_elasticidad, elasticidad, bloques)
 
 
-def build_demand_forecast_cached(ventas_nse: pd.DataFrame) -> pd.DataFrame:
-    """Calcula demanda_base_futura sin recalcular elasticidad ni aplicar promociones."""
+def build_demand_forecast_cached(
+    ventas_nse: pd.DataFrame,
+    metodos: tuple[str, ...] | None = None,
+    horizontes: tuple[str, ...] | None = None,
+    pesos_manual: tuple[tuple[str, float], ...] | None = None,
+) -> pd.DataFrame:
+    """Calcula demanda_base_futura sin recalcular elasticidad ni aplicar promociones.
+
+    Los parámetros de método/horizonte/ventanas se pasan como tuplas para que el
+    caché de Streamlit pueda hashearlos. ``pesos_manual`` permite a la vista 4
+    sobreescribir las ventanas del método "Manual avanzado" sin tocar el motor.
+    """
     from modules.demand_forecast import build_demanda_base_futura
 
-    return build_demanda_base_futura(ventas_nse)
+    pesos_config = None
+    if pesos_manual:
+        pesos_dict = {k: v for k, v in pesos_manual}
+        if pesos_dict:
+            pesos_config = {
+                "1 mes": {"Manual avanzado": pesos_dict},
+                "3 meses": {"Manual avanzado": pesos_dict},
+            }
+    return build_demanda_base_futura(
+        ventas_nse,
+        horizontes=list(horizontes) if horizontes else None,
+        metodos=list(metodos) if metodos else None,
+        pesos_config=pesos_config,
+    )
 
 
 @st.cache_data(show_spinner=False, max_entries=5)
@@ -184,6 +207,24 @@ def build_future_pricing_cached(
     from modules.future_pricing import build_pricing_futuro_escenarios
 
     return build_pricing_futuro_escenarios(demanda_base_futura, elasticidades_periodo, ventas_nse)
+
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def build_recommendations_cached(
+    pricing_futuro_escenarios: pd.DataFrame,
+    elasticidades_periodo: pd.DataFrame,
+    demanda_base_futura: pd.DataFrame,
+    ventas_nse: pd.DataFrame,
+) -> pd.DataFrame:
+    """Fase 7: motor de recomendaciones híbrido (reglas + simulación; RF opcional desactivado)."""
+    from modules.recommendations import generar_recomendaciones
+
+    return generar_recomendaciones(
+        pricing_futuro_escenarios,
+        elasticidades_periodo,
+        demanda_base_futura,
+        ventas_nse,
+    )
 
 
 @st.cache_data(show_spinner=False, max_entries=5)
@@ -483,6 +524,11 @@ def init_state() -> None:
         "historical_pricing_ready": False,
         "demand_forecast_ready": False,
         "future_pricing_ready": False,
+        "recommendations_ready": False,
+        "recomendaciones_sku": pd.DataFrame(),
+        "future_metodo": "Automático recomendado",
+        "future_horizonte_sel": "Ambos",
+        "future_manual_ventanas": [],
         "ventas_limpias": pd.DataFrame(),
         "ventas_nse": pd.DataFrame(),
         "promo_df": None,
@@ -508,7 +554,7 @@ def init_state() -> None:
         "quality_cache_key": None,
         "elasticity_cache_key": None,
         "pricing_cache_key": None,
-        "manual_cache": {"quality": {}, "elasticity": {}, "pricing": {}, "pricing_historico": {}, "demand_forecast": {}, "pricing_futuro": {}},
+        "manual_cache": {"quality": {}, "elasticity": {}, "pricing": {}, "pricing_historico": {}, "demand_forecast": {}, "pricing_futuro": {}, "recomendaciones": {}},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -522,6 +568,8 @@ def reset_model_results() -> None:
     st.session_state.historical_pricing_ready = False
     st.session_state.demand_forecast_ready = False
     st.session_state.future_pricing_ready = False
+    st.session_state.recommendations_ready = False
+    st.session_state.recomendaciones_sku = pd.DataFrame()
     st.session_state.elasticidad = pd.DataFrame()
     st.session_state.elasticidades_periodo = pd.DataFrame()
     st.session_state.ventas_base_elasticidad = pd.DataFrame()
@@ -532,6 +580,7 @@ def reset_model_results() -> None:
     st.session_state.pricing_historico_escenarios = pd.DataFrame()
     st.session_state.demanda_base_futura = pd.DataFrame()
     st.session_state.pricing_futuro_escenarios = pd.DataFrame()
+    st.session_state.recomendaciones_sku = pd.DataFrame()
 
 
 def render_sidebar() -> str:
@@ -546,6 +595,8 @@ def render_sidebar() -> str:
             "2. Elasticidad",
             "3. Pricing histórico (backtesting)",
             "4. Pricing futuro (simulador)",
+            "5. Recomendaciones ejecutivas",
+            "6. Exportables",
         ],
     )
 
@@ -1084,13 +1135,31 @@ def ensure_future_pricing_ready() -> bool:
         return False
 
     try:
-        pricing_key = (analysis_key, "pricing_futuro_escenarios_v1")
+        # La selección de método/horizonte forma parte de la firma del caché para
+        # recomputar solo cuando cambia la configuración (no en cada filtro visual).
+        metodo_sel = st.session_state.get("future_metodo", "Automático recomendado")
+        horizonte_sel = st.session_state.get("future_horizonte_sel", "Ambos")
+        horizontes = ("1 mes", "3 meses") if horizonte_sel == "Ambos" else (horizonte_sel,)
+        pesos_manual = None
+        if metodo_sel == "Manual avanzado":
+            ventanas = tuple(st.session_state.get("future_manual_ventanas") or ())
+            if ventanas:
+                peso = 1.0 / len(ventanas)
+                pesos_manual = tuple((v, peso) for v in ventanas)
+        config_sig = (metodo_sel, horizontes, pesos_manual)
+
+        pricing_key = (analysis_key, config_sig, "pricing_futuro_escenarios_v2")
         cache_pr = st.session_state.manual_cache.setdefault("pricing_futuro", {})
         if pricing_key in cache_pr:
             demanda_base_futura, pricing_futuro_escenarios = cache_pr[pricing_key]
         else:
             with st.spinner("Calculando demanda_base_futura y simulando escenarios futuros..."):
-                demanda_base_futura = build_demand_forecast_cached(st.session_state.ventas_nse)
+                demanda_base_futura = build_demand_forecast_cached(
+                    st.session_state.ventas_nse,
+                    metodos=(metodo_sel,),
+                    horizontes=horizontes,
+                    pesos_manual=pesos_manual,
+                )
                 pricing_futuro_escenarios = build_future_pricing_cached(
                     demanda_base_futura,
                     elasticidades_periodo,
@@ -1113,6 +1182,56 @@ def ensure_future_pricing_ready() -> bool:
         return False
 
 
+DEMANDA_VENTANAS_MANUAL = [
+    ("ultimos_3_meses", "Últimos 3 meses"),
+    ("ultimos_6_meses", "Últimos 6 meses"),
+    ("ultimos_12_meses", "Últimos 12 meses"),
+    ("ultimos_24_meses", "Últimos 24 meses"),
+    ("mismo_mes_historico", "Mismo mes histórico"),
+    ("mismo_trimestre_historico", "Mismo trimestre histórico"),
+]
+
+
+def render_future_pricing_controls() -> None:
+    """Controles de horizonte y método de proyección (Vista 4, Fase 8)."""
+    st.subheader("Configuración de proyección de demanda")
+
+    col_h, col_m = st.columns([1, 2])
+    with col_h:
+        st.radio(
+            "Horizonte",
+            ["1 mes", "3 meses", "Ambos"],
+            index=["1 mes", "3 meses", "Ambos"].index(st.session_state.get("future_horizonte_sel", "Ambos")),
+            key="future_horizonte_sel",
+            horizontal=True,
+        )
+    with col_m:
+        from modules.config import DEMANDA_FUTURA_METODOS
+
+        st.selectbox(
+            "Método de proyección",
+            DEMANDA_FUTURA_METODOS,
+            index=DEMANDA_FUTURA_METODOS.index(st.session_state.get("future_metodo", "Automático recomendado")),
+            key="future_metodo",
+        )
+
+    if st.session_state.get("future_metodo") == "Manual avanzado":
+        st.caption("Selecciona las ventanas históricas a combinar (se reparten con peso uniforme):")
+        cols = st.columns(3)
+        seleccionadas: list[str] = []
+        previas = set(st.session_state.get("future_manual_ventanas") or ["ultimos_3_meses", "ultimos_12_meses", "mismo_mes_historico"])
+        for i, (clave, etiqueta) in enumerate(DEMANDA_VENTANAS_MANUAL):
+            with cols[i % 3]:
+                if st.checkbox(etiqueta, value=clave in previas, key=f"manual_ventana_{clave}"):
+                    seleccionadas.append(clave)
+        st.session_state.future_manual_ventanas = seleccionadas
+
+    st.info(
+        "El sistema calculará la demanda base usando las ventanas históricas seleccionadas y "
+        "después aplicará la elasticidad estimada para simular escenarios de precio."
+    )
+
+
 def render_future_pricing_view() -> None:
     """Vista 4: Future Pricing Simulator (Fase 5)."""
     st.title("4. Pricing futuro (simulador)")
@@ -1124,6 +1243,9 @@ def render_future_pricing_view() -> None:
 
     if not require_processed():
         return
+
+    render_future_pricing_controls()
+
     if not ensure_future_pricing_ready():
         return
 
@@ -1192,6 +1314,186 @@ def render_future_pricing_view() -> None:
         mime="text/csv; charset=utf-8",
         use_container_width=True,
     )
+
+def ensure_recommendations_ready() -> bool:
+    """Genera recomendaciones_sku (Fase 7) a partir de pricing_futuro_escenarios."""
+    if not st.session_state.get("future_pricing_ready", False):
+        st.warning(
+            "Primero calcula el **pricing futuro** en la vista **4. Pricing futuro (simulador)**. "
+            "Las recomendaciones se construyen sobre los escenarios futuros simulados."
+        )
+        return False
+
+    sim = st.session_state.get("pricing_futuro_escenarios", pd.DataFrame())
+    if sim is None or sim.empty:
+        st.warning("No hay escenarios futuros disponibles para generar recomendaciones.")
+        return False
+
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        button_clicked = st.button(
+            "Calcular / actualizar recomendaciones",
+            type="primary" if not st.session_state.recommendations_ready else "secondary",
+            use_container_width=True,
+        )
+    with col_b:
+        st.caption(
+            "Fase 7: motor híbrido (reglas de negocio + simulación financiera). "
+            "El Random Forest queda como apoyo opcional y nunca decide la recomendación."
+        )
+
+    if st.session_state.recommendations_ready and not button_clicked:
+        return True
+    if not button_clicked and not st.session_state.recommendations_ready:
+        st.info("Presiona **Calcular / actualizar recomendaciones** para ejecutar la Fase 7.")
+        return False
+
+    try:
+        analysis_key = (
+            st.session_state.get("sales_signature"),
+            st.session_state.get("nse_signature"),
+            st.session_state.get("promo_signature"),
+        )
+        reco_key = (analysis_key, "recomendaciones_sku_v1")
+        cache_re = st.session_state.manual_cache.setdefault("recomendaciones", {})
+        if reco_key in cache_re:
+            recomendaciones = cache_re[reco_key]
+        else:
+            with st.spinner("Generando recomendaciones ejecutivas..."):
+                recomendaciones = build_recommendations_cached(
+                    sim,
+                    st.session_state.get("elasticidades_periodo", pd.DataFrame()),
+                    st.session_state.get("demanda_base_futura", pd.DataFrame()),
+                    st.session_state.ventas_nse,
+                )
+            cache_re.clear()
+            cache_re[reco_key] = recomendaciones
+
+        st.session_state.recomendaciones_sku = recomendaciones
+        st.session_state.recommendations_ready = True
+        st.success("Recomendaciones generadas correctamente.")
+        return True
+    except Exception as exc:
+        st.session_state.recommendations_ready = False
+        st.error(f"No se pudieron generar las recomendaciones: {exc}")
+        return False
+
+
+def render_recommendations_view() -> None:
+    """Vista 5: Recomendaciones ejecutivas (Fase 7)."""
+    st.title("5. Recomendaciones ejecutivas")
+    st.caption("Ranking accionable por SKU: qué hacer con el precio y por qué.")
+    st.info(
+        "Cada SKU recibe una **categoría de recomendación** (subir / bajar-promover / mantener / no recomendar) "
+        "y una **estrategia específica**, con su razón en español. Decisión por reglas; ML solo de apoyo."
+    )
+
+    if not require_processed():
+        return
+    if not ensure_recommendations_ready():
+        return
+
+    reco = st.session_state.get("recomendaciones_sku", pd.DataFrame())
+    if reco is None or reco.empty:
+        st.warning("No hay recomendaciones disponibles para la base actual.")
+        return
+
+    st.subheader("Filtros")
+    f1, f2, f3, f4, f5 = st.columns(5)
+    categoria = _dependent_selectbox("Categoría", ["Todos"] + _safe_sorted_options(reco, "categoria"), "reco_categoria", "Todos", f1)
+    df_c = _filter_fast(reco, "categoria", categoria)
+    departamento = _dependent_selectbox("Departamento", ["Todos"] + _safe_sorted_options(df_c, "departamento"), "reco_departamento", "Todos", f2)
+    df_d = _filter_fast(df_c, "departamento", departamento)
+    horizonte = _dependent_selectbox("Horizonte", ["Todos"] + _safe_sorted_options(df_d, "horizonte"), "reco_horizonte", "Todos", f3)
+    df_h = _filter_fast(df_d, "horizonte", horizonte)
+    cat_reco = _dependent_selectbox("Recomendación", ["Todos"] + _safe_sorted_options(df_h, "categoria_recomendacion"), "reco_cat_reco", "Todos", f4)
+    df_r = _filter_fast(df_h, "categoria_recomendacion", cat_reco)
+    confianza = _dependent_selectbox("Confianza", ["Todos"] + _safe_sorted_options(df_r, "confianza_final"), "reco_confianza", "Todos", f5)
+    selected = _filter_fast(df_r, "confianza_final", confianza)
+
+    if selected.empty:
+        st.warning("No hay datos para esta selección.")
+        return
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        render_kpi_card("SKUs en ranking", format_num(selected["SKU"].nunique(), 0), "Dentro del filtro")
+    with k2:
+        render_kpi_card("Ingreso esperado", format_money(pd.to_numeric(selected["ingreso_esperado"], errors="coerce").sum()), "Futuro")
+    with k3:
+        render_kpi_card("Margen esperado", format_money(pd.to_numeric(selected["margen_esperado"], errors="coerce").sum()), "Futuro")
+    with k4:
+        recomendables = selected["categoria_recomendacion"].ne("No recomendar").mean() * 100
+        render_kpi_card("SKUs con acción", f"{recomendables:.1f}%", "Recomendados")
+
+    st.subheader("Distribución de recomendaciones")
+    st.dataframe(
+        selected["categoria_recomendacion"].value_counts(dropna=False).rename_axis("categoria_recomendacion").reset_index(name="SKUs"),
+        use_container_width=True,
+    )
+
+    st.subheader("Ranking de SKUs")
+    ranking_cols = [
+        "SKU", "categoria", "departamento", "horizonte",
+        "categoria_recomendacion", "estrategia_especifica",
+        "precio_recomendado", "ingreso_esperado", "margen_esperado",
+        "confianza_final", "riesgo", "razon_recomendacion",
+    ]
+    ranking = selected[[c for c in ranking_cols if c in selected.columns]].copy()
+    ranking = ranking.sort_values("ingreso_esperado", ascending=False, na_position="last")
+    st.dataframe(ranking, use_container_width=True)
+    st.caption("La columna `razon_recomendacion` explica en español el porqué de cada recomendación.")
+
+    st.subheader("Descarga")
+    st.download_button(
+        "Descargar recomendaciones_sku filtrado",
+        data=_df_to_excel_friendly_csv_bytes(selected, sep=";"),
+        file_name="recomendaciones_sku.csv",
+        mime="text/csv; charset=utf-8",
+        use_container_width=True,
+    )
+
+
+def render_exportables_view() -> None:
+    """Vista 6: Exportables (placeholder de UI; se cablea por completo en Fase 10)."""
+    st.title("6. Exportables")
+    st.caption("Descarga las tablas internas calculadas en formato CSV.")
+    st.info(
+        "Cada botón exporta una tabla ya calculada. Si una tabla aún no se ha generado, "
+        "ve a su vista correspondiente y ejecútala primero."
+    )
+
+    if not require_processed():
+        return
+
+    exportables = [
+        ("diagnostico_calidad.csv", "diagnostico_calidad", "Diagnóstico de calidad"),
+        ("ventas_limpias.csv", "ventas_limpias", "Ventas limpias"),
+        ("elasticidades_periodo.csv", "elasticidades_periodo", "Elasticidades por periodo"),
+        ("pricing_historico_escenarios.csv", "pricing_historico_escenarios", "Pricing histórico (escenarios)"),
+        ("demanda_base_futura.csv", "demanda_base_futura", "Demanda base futura"),
+        ("pricing_futuro_escenarios.csv", "pricing_futuro_escenarios", "Pricing futuro (escenarios)"),
+        ("recomendaciones_sku.csv", "recomendaciones_sku", "Recomendaciones por SKU"),
+    ]
+
+    for file_name, state_key, label in exportables:
+        df = st.session_state.get(state_key, pd.DataFrame())
+        col_a, col_b = st.columns([3, 2])
+        with col_a:
+            disponible = isinstance(df, pd.DataFrame) and not df.empty
+            estado = f"✅ {len(df)} filas" if disponible else "⏳ aún no generada"
+            st.markdown(f"**{label}** — `{file_name}` · {estado}")
+        with col_b:
+            st.download_button(
+                f"Descargar {file_name}",
+                data=_df_to_excel_friendly_csv_bytes(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), sep=";"),
+                file_name=file_name,
+                mime="text/csv; charset=utf-8",
+                use_container_width=True,
+                disabled=not (isinstance(df, pd.DataFrame) and not df.empty),
+                key=f"export_{state_key}",
+            )
+
 
 def render_historical_pricing_view() -> None:
     """Vista 3: Historical Pricing Simulator separado de pricing futuro."""
@@ -2410,7 +2712,15 @@ def main() -> None:
         render_historical_pricing_view()
         return
 
-    render_future_pricing_view()
+    if vista.startswith("4."):
+        render_future_pricing_view()
+        return
+
+    if vista.startswith("5."):
+        render_recommendations_view()
+        return
+
+    render_exportables_view()
 
 
 if __name__ == "__main__":

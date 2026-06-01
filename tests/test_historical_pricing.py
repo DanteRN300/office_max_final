@@ -94,7 +94,18 @@ def test_build_pricing_historico_escenarios_calculates_promotions_and_flags_risk
 
     out = build_pricing_historico_escenarios(ventas, elasticidades, periodo_tipos=["mensual"])
 
-    promo_2x1 = out[out["tipo_escenario"].eq("promocion_2x1")].iloc[0]
+    # Fase 6: tipo_escenario es "simple"|"promocional"; la identidad concreta
+    # de la promoción vive en nombre_escenario.
+    promo_rows = out[out["tipo_escenario"].eq("promocional")]
+    assert set(promo_rows["nombre_escenario"]) == {
+        "promoción 2x1",
+        "promoción 3x2",
+        "promoción segundo producto al 50%",
+    }
+    assert set(out.loc[~out["tipo_escenario"].eq("promocional"), "tipo_escenario"]) == {"simple"}
+
+    promo_2x1 = out[out["nombre_escenario"].eq("promoción 2x1")].iloc[0]
+    assert promo_2x1["tipo_escenario"] == "promocional"
     assert promo_2x1["precio_efectivo"] == 5
     assert promo_2x1["descuento_efectivo"] == 50
     assert promo_2x1["cambio_precio_pct"] == -50
@@ -104,12 +115,12 @@ def test_build_pricing_historico_escenarios_calculates_promotions_and_flags_risk
     assert promo_2x1["riesgo_promocion"] == "Alto"
     assert promo_2x1["recomendacion_historica"] == "No recomendar"
 
-    promo_3x2 = out[out["tipo_escenario"].eq("promocion_3x2")].iloc[0]
+    promo_3x2 = out[out["nombre_escenario"].eq("promoción 3x2")].iloc[0]
     assert round(promo_3x2["precio_efectivo"], 4) == 6.6667
     assert round(promo_3x2["descuento_efectivo"], 2) == 33.33
     assert round(promo_3x2["unidades_simuladas"], 4) == 26.666
 
-    promo_segundo_50 = out[out["tipo_escenario"].eq("promocion_segundo_50")].iloc[0]
+    promo_segundo_50 = out[out["nombre_escenario"].eq("promoción segundo producto al 50%")].iloc[0]
     assert promo_segundo_50["precio_efectivo"] == 7.5
     assert promo_segundo_50["descuento_efectivo"] == 25
     assert promo_segundo_50["unidades_simuladas"] == 25

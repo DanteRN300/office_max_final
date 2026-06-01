@@ -31,7 +31,7 @@ ESCENARIOS_HISTORICOS = pd.DataFrame(
     ],
     columns=["escenario_id", "nombre_escenario", "cambio_precio_pct"],
 )
-ESCENARIOS_HISTORICOS["tipo_escenario"] = "cambio_precio_simple"
+ESCENARIOS_HISTORICOS["tipo_escenario"] = "simple"
 ESCENARIOS_HISTORICOS = escenarios_con_promociones(ESCENARIOS_HISTORICOS)
 
 PRICING_HISTORICO_ESCENARIOS_COLUMNS = [

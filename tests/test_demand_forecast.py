@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -41,7 +42,9 @@ def test_build_demanda_base_futura_calculates_1m_and_3m_without_elasticity():
     assert str(one_month["fecha_fin_proyeccion"]) == "2025-01-31"
     expected_1m = 0.50 * 110 + 0.30 * 65 + 0.20 * 10
     assert one_month["demanda_base"] == expected_1m
-    assert one_month["pesos_usados"] == {
+    # pesos_usados se almacena como JSON string (no dict), según la especificación.
+    assert isinstance(one_month["pesos_usados"], str)
+    assert json.loads(one_month["pesos_usados"]) == {
         "ultimos_3_meses": 0.50,
         "ultimos_12_meses": 0.30,
         "mismo_mes_historico": 0.20,
@@ -67,7 +70,8 @@ def test_build_demanda_base_futura_redistributes_missing_windows_and_keeps_rows(
 
     auto_1m = out[(out["horizonte"].eq("1 mes")) & (out["metodo_proyeccion"].eq("Automático recomendado"))].iloc[0]
     assert auto_1m["demanda_base"] == 20
-    assert auto_1m["pesos_usados"] == {"ultimos_3_meses": 1.0}
+    assert isinstance(auto_1m["pesos_usados"], str)
+    assert json.loads(auto_1m["pesos_usados"]) == {"ultimos_3_meses": 1.0}
     assert auto_1m["confianza_demanda"] in {"Media", "Baja"}
     assert "Ventanas sin datos suficientes" in auto_1m["razon_confianza_demanda"]
 
