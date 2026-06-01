@@ -238,34 +238,49 @@ def build_historical_sales_ml_cached(ventas_nse: pd.DataFrame) -> dict:
 @st.cache_data(show_spinner=False, max_entries=10)
 def build_elasticity_curve_data(
     curva_df: pd.DataFrame,
-    min_price: float,
-    max_price: float,
-    max_skus: int,
+    max_skus: int = 8,
 ) -> pd.DataFrame:
-    """Construye datos para la curva de elasticidad usando caché."""
+    """Construye la curva precio-demanda log-log por SKU desde elasticidades_periodo.
+
+    Usa la forma constante de elasticidad: Q(P) = unidades_promedio * (P/precio_promedio)^elasticidad.
+    Genera un rango de precios alrededor del precio promedio observado de cada SKU.
+    Devuelve columnas: SKU, periodo, Precio, "Demanda estimada".
+    """
     import numpy as np
 
     if curva_df is None or curva_df.empty:
         return pd.DataFrame()
 
-    precios = np.linspace(max(0.01, float(min_price)), max(0.02, float(max_price)), 60)
+    requeridas = {"SKU", "elasticidad", "precio_promedio", "unidades_promedio"}
+    if not requeridas.issubset(curva_df.columns):
+        return pd.DataFrame()
+
+    base = curva_df.copy()
+    base["elasticidad"] = pd.to_numeric(base["elasticidad"], errors="coerce")
+    base["precio_promedio"] = pd.to_numeric(base["precio_promedio"], errors="coerce")
+    base["unidades_promedio"] = pd.to_numeric(base["unidades_promedio"], errors="coerce")
+    base = base.dropna(subset=["elasticidad", "precio_promedio", "unidades_promedio"])
+    base = base[(base["precio_promedio"] > 0) & (base["unidades_promedio"] > 0)]
+    if base.empty:
+        return pd.DataFrame()
+
     curva_rows = []
-    for _, row in curva_df.head(max_skus).iterrows():
-        alfa = row.get("Alfa")
-        beta = row.get("Elasticidad")
+    for _, row in base.head(max_skus).iterrows():
+        beta = float(row["elasticidad"])
+        p0 = float(row["precio_promedio"])
+        q0 = float(row["unidades_promedio"])
         sku = row.get("SKU")
-        trimestre = row.get("trimestre")
-        if pd.isna(alfa) or pd.isna(beta):
-            continue
+        periodo = row.get("periodo", "")
+        precios = np.linspace(p0 * 0.6, p0 * 1.4, 50)
         for precio in precios:
-            demanda = np.exp(alfa + beta * np.log(precio))
-            if np.isfinite(demanda):
+            demanda = q0 * (precio / p0) ** beta
+            if np.isfinite(demanda) and demanda >= 0:
                 curva_rows.append(
                     {
-                        "SKU": sku,
+                        "SKU": str(sku),
+                        "periodo": str(periodo),
                         "Precio": precio,
                         "Demanda estimada": demanda,
-                        "trimestre": trimestre,
                     }
                 )
     return pd.DataFrame(curva_rows)
@@ -277,15 +292,36 @@ def aggregate_weekly_demand(ventas_f: pd.DataFrame) -> pd.DataFrame:
     if ventas_f is None or ventas_f.empty:
         return pd.DataFrame()
 
-    if "tiene_promocion" in ventas_f.columns and ventas_f["tiene_promocion"].sum() > 0:
+    df = ventas_f.copy()
+    # tran_date puede llegar como string (dd/mm/YYYY); pd.Grouper(freq="W") exige
+    # datetime, de lo contrario el gráfico sale vacío o roto. Se normaliza primero.
+    if "tran_date" not in df.columns or "qty" not in df.columns:
+        return pd.DataFrame()
+    if not pd.api.types.is_datetime64_any_dtype(df["tran_date"]):
+        from modules.utils import parse_transaction_dates
+
+        df["tran_date"] = parse_transaction_dates(df["tran_date"])
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+    df = df.dropna(subset=["tran_date", "qty"])
+    if df.empty:
+        return pd.DataFrame()
+
+    if "tiene_promocion" in df.columns and pd.to_numeric(df["tiene_promocion"], errors="coerce").fillna(0).sum() > 0:
         serie = (
-            ventas_f.groupby([pd.Grouper(key="tran_date", freq="W"), "tiene_promocion"], as_index=False)
+            df.groupby([pd.Grouper(key="tran_date", freq="W"), "tiene_promocion"])
             .agg(Demanda=("qty", "sum"))
+            .reset_index()
         )
         serie["Promoción"] = serie["tiene_promocion"].map({1: "Con promoción", 0: "Sin promoción"}).fillna("Sin promoción")
         return serie
 
-    return ventas_f.groupby(pd.Grouper(key="tran_date", freq="W"), as_index=False).agg(Demanda=("qty", "sum"))
+    # reset_index explícito: con un único Grouper, as_index=False no siempre
+    # devuelve tran_date como columna, dejando la serie sin eje X.
+    return (
+        df.groupby(pd.Grouper(key="tran_date", freq="W"))
+        .agg(Demanda=("qty", "sum"))
+        .reset_index()
+    )
 
 
 @st.cache_data(show_spinner=False, max_entries=10)
@@ -330,6 +366,33 @@ def aggregate_pricing_chart_data(selected: pd.DataFrame) -> tuple[pd.DataFrame, 
     return money_long, qty_long, im_long
 
 
+# Orden lógico de escenarios de precio: primero los decrementos (de mayor a menor
+# descuento), luego mantener, luego los incrementos, y al final las promociones.
+_ORDEN_ESCENARIOS = [
+    "bajar precio 20%",
+    "bajar precio 15%",
+    "bajar precio 10%",
+    "bajar precio 5%",
+    "mantener precio",
+    "subir precio 5%",
+    "subir precio 10%",
+    "subir precio 15%",
+    "subir precio 20%",
+    "promoción 2x1",
+    "promoción 3x2",
+    "promoción segundo producto al 50%",
+]
+_ORDEN_ESCENARIOS_INDEX = {nombre: i for i, nombre in enumerate(_ORDEN_ESCENARIOS)}
+
+
+def _sort_escenarios(valores: list[str]) -> list[str]:
+    """Ordena nombres de escenario por lógica de precio (decremento -> incremento)."""
+    conocidos = [v for v in valores if v.lower() in _ORDEN_ESCENARIOS_INDEX]
+    otros = sorted(v for v in valores if v.lower() not in _ORDEN_ESCENARIOS_INDEX)
+    conocidos.sort(key=lambda v: _ORDEN_ESCENARIOS_INDEX[v.lower()])
+    return conocidos + otros
+
+
 def _safe_sorted_options(df: pd.DataFrame, col: str | None) -> list[str]:
     """Devuelve opciones limpias y ordenadas para filtros dependientes."""
     if df is None or df.empty or col is None or col not in df.columns:
@@ -341,7 +404,11 @@ def _safe_sorted_options(df: pd.DataFrame, col: str | None) -> list[str]:
         .map(str.strip)
     )
     values = values[values != ""]
-    return sorted(values.unique().tolist())
+    unicos = values.unique().tolist()
+    # Para columnas de escenario se usa el orden lógico de precio, no el alfabético.
+    if col in {"nombre_escenario", "escenario"}:
+        return _sort_escenarios(unicos)
+    return sorted(unicos)
 
 
 def _filter_fast(df: pd.DataFrame, col: str | None, value: object) -> pd.DataFrame:
@@ -1276,33 +1343,73 @@ def _render_mejor_escenario_detalle(selected: pd.DataFrame) -> None:
 
 
 def _render_graficas_futuro(selected: pd.DataFrame) -> None:
-    """Renderiza gráficas de ingreso/margen y unidades por escenario."""
+    """Gráficas base vs proyectado por escenario: margen, ingreso y unidades.
+
+    En el pricing futuro no existe un valor "real"; la referencia es la base
+    (demanda al precio actual, sin cambio). Cada gráfica compara ese valor base
+    contra el proyectado por cada escenario de precio.
+    """
     import plotly.express as px
 
-    ranking = _ranking_escenarios_futuro(selected)
-    if ranking.empty:
+    if selected is None or selected.empty:
         st.info("No hay datos suficientes para graficar escenarios.")
         return
 
+    df = selected.copy()
+    for col in ["margen_base", "margen_simulado", "ingreso_base", "ingreso_simulado",
+                "demanda_base", "unidades_simuladas"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    agg = (
+        df.groupby("nombre_escenario", observed=True, sort=False)
+        .agg(
+            margen_base=("margen_base", "sum"),
+            margen_simulado=("margen_simulado", "sum"),
+            ingreso_base=("ingreso_base", "sum"),
+            ingreso_simulado=("ingreso_simulado", "sum"),
+            demanda_base=("demanda_base", "sum"),
+            unidades_simuladas=("unidades_simuladas", "sum"),
+        )
+        .reset_index()
+    )
+    if agg.empty:
+        st.info("No hay datos suficientes para graficar escenarios.")
+        return
+
+    def _grafica_comparativa(base_col: str, proj_col: str, base_lbl: str, proj_lbl: str, titulo: str, eje_y: str):
+        if not (agg[base_col].notna().any() or agg[proj_col].notna().any()):
+            st.info(f"No hay datos para {titulo.lower()}.")
+            return
+        long = agg.melt(
+            id_vars="nombre_escenario",
+            value_vars=[base_col, proj_col],
+            var_name="tipo",
+            value_name="valor",
+        )
+        long["tipo"] = long["tipo"].map({base_col: base_lbl, proj_col: proj_lbl})
+        fig = px.bar(
+            long, x="nombre_escenario", y="valor", color="tipo", barmode="group",
+            category_orders={"tipo": [base_lbl, proj_lbl]}, title=titulo,
+        )
+        fig.update_layout(xaxis_title="Escenario", yaxis_title=eje_y, legend_title="")
+        st.plotly_chart(fig, use_container_width=True)
+
     g1, g2 = st.columns(2)
     with g1:
-        value_vars = [c for c in ["ingreso_simulado", "margen_simulado"] if ranking[c].notna().any()]
-        chart_long = ranking.melt(
-            id_vars="nombre_escenario", value_vars=value_vars, var_name="métrica", value_name="monto"
+        _grafica_comparativa(
+            "margen_base", "margen_simulado", "Margen base", "Margen proyectado",
+            "Margen: base vs proyectado por escenario", "Margen",
         )
-        fig_money = px.bar(
-            chart_long, x="nombre_escenario", y="monto", color="métrica", barmode="group",
-            title="Ingreso y margen simulado por escenario",
-        )
-        fig_money.update_layout(xaxis_title="Escenario", yaxis_title="Monto", legend_title="")
-        st.plotly_chart(fig_money, use_container_width=True)
     with g2:
-        fig_units = px.bar(
-            ranking, x="nombre_escenario", y="unidades_simuladas",
-            title="Unidades simuladas por escenario",
+        _grafica_comparativa(
+            "ingreso_base", "ingreso_simulado", "Ingreso base", "Ingreso proyectado",
+            "Ingreso: base vs proyectado por escenario", "Ingreso",
         )
-        fig_units.update_layout(xaxis_title="Escenario", yaxis_title="Unidades", showlegend=False)
-        st.plotly_chart(fig_units, use_container_width=True)
+    _grafica_comparativa(
+        "demanda_base", "unidades_simuladas", "Unidades base", "Unidades proyectadas",
+        "Unidades: base vs proyectado por escenario", "Unidades",
+    )
 
 
 def render_future_pricing_controls() -> None:
@@ -1526,8 +1633,11 @@ def render_recommendations_view() -> None:
     df_c = _filter_fast(reco, "categoria", categoria)
     departamento = _dependent_selectbox("Departamento", ["Todos"] + _safe_sorted_options(df_c, "departamento"), "reco_departamento", "Todos", f2)
     df_d = _filter_fast(df_c, "departamento", departamento)
-    horizonte = _dependent_selectbox("Horizonte", ["Todos"] + _safe_sorted_options(df_d, "horizonte"), "reco_horizonte", "Todos", f3)
-    df_h = _filter_fast(df_d, "horizonte", horizonte)
+    # El horizonte se muestra explícitamente como 1 mes / 3 meses / Ambos.
+    # "Ambos" equivale a no filtrar por horizonte.
+    horizontes_disponibles = [h for h in ["1 mes", "3 meses"] if h in _safe_sorted_options(df_d, "horizonte")]
+    horizonte = _dependent_selectbox("Horizonte", ["Ambos"] + horizontes_disponibles, "reco_horizonte", "Ambos", f3)
+    df_h = df_d if horizonte == "Ambos" else _filter_fast(df_d, "horizonte", horizonte)
     cat_reco = _dependent_selectbox("Recomendación", ["Todos"] + _safe_sorted_options(df_h, "categoria_recomendacion"), "reco_cat_reco", "Todos", f4)
     df_r = _filter_fast(df_h, "categoria_recomendacion", cat_reco)
     confianza = _dependent_selectbox("Confianza", ["Todos"] + _safe_sorted_options(df_r, "confianza_final"), "reco_confianza", "Todos", f5)
@@ -2416,6 +2526,7 @@ def render_elasticity_view() -> None:
                         x="tran_date",
                         y="Demanda",
                         color="Promoción",
+                        markers=True,
                         title="Demanda semanal con/sin promoción",
                     )
                 else:
@@ -2423,13 +2534,37 @@ def render_elasticity_view() -> None:
                         serie,
                         x="tran_date",
                         y="Demanda",
+                        markers=True,
                         title="Demanda semanal",
                     )
+                fig.update_layout(xaxis_title="Semana", yaxis_title="Unidades")
 
                 st.plotly_chart(
                     fig,
                     use_container_width=True,
                 )
+
+        st.subheader("Curva de elasticidad (precio vs demanda estimada)")
+        curva = build_elasticity_curve_data(filtered, max_skus=MAX_SKUS_CURVA_ELASTICIDAD)
+        if curva.empty:
+            st.info(
+                "No hay datos suficientes para la curva de elasticidad con los filtros actuales. "
+                "Se requiere elasticidad, precio promedio y unidades promedio válidos por SKU."
+            )
+        else:
+            fig_curva = px.line(
+                curva,
+                x="Precio",
+                y="Demanda estimada",
+                color="SKU",
+                title="Curva precio-demanda log-log por SKU (Q = Q₀·(P/P₀)^elasticidad)",
+            )
+            fig_curva.update_layout(xaxis_title="Precio", yaxis_title="Demanda estimada")
+            st.plotly_chart(fig_curva, use_container_width=True)
+            st.caption(
+                "Cada curva muestra cómo cambiaría la demanda estimada al variar el precio, "
+                "según la elasticidad calculada del SKU. Pendiente más pronunciada = más elástico."
+            )
 
         st.subheader("Mapa geográfico de México")
 
